@@ -2,89 +2,38 @@ import { Innertube } from "youtubei.js";
 import type { CaptionTrackData } from "youtubei.js/PlayerCaptionsTracklist";
 import { HTTPException } from "hono/http-exception";
 
-function createTemporalDuration(milliseconds: number) {
-    return new Temporal.Duration(
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        milliseconds,
-    );
-}
-
-const ESCAPE_SUBSTITUTIONS = {
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    "\u200E": "&lrm;",
-    "\u200F": "&rlm;",
-    "\u00A0": "&nbsp;",
-};
-
 export async function handleTranscripts(
-    innertubeClient: Innertube,
-    videoId: string,
+    _innertubeClient: Innertube,
+    _videoId: string,
     selectedCaption: CaptionTrackData,
 ) {
-    const lines: string[] = ["WEBVTT"];
+    // Fetch the caption track's timedtext `base_url` directly (the same source
+    // yt-dlp uses), forcing WebVTT output. This replaces youtubei.js
+    // `getTranscript()` (the `get_transcript` RPC), which currently returns
+    // FAILED_PRECONDITION from YouTube for many videos. The base_url comes from
+    // the po-token'd player response, so it is not IP-blocked like Invidious's
+    // bare timedtext fetch.
+    const url = new URL(selectedCaption.base_url);
+    url.searchParams.set("fmt", "vtt");
 
-    const info = await innertubeClient.getInfo(videoId);
-    const transcriptInfo = await (await info.getTranscript()).selectLanguage(
-        selectedCaption.name.text || "",
-    );
-    const rawTranscriptLines = transcriptInfo.transcript.content?.body
-        ?.initial_segments;
+    const response = await fetch(url.toString());
 
-    if (rawTranscriptLines == undefined) throw new HTTPException(404);
+    if (!response.ok) {
+        throw new HTTPException(502, {
+            res: new Response(
+                `Failed to fetch captions (upstream ${response.status}).`,
+            ),
+        });
+    }
 
-    rawTranscriptLines.forEach((line) => {
-        const timestampFormatOptions = {
-            style: "digital",
-            minutesDisplay: "always",
-            fractionalDigits: 3,
-        };
+    const body = await response.text();
 
-        // Temporal.Duration.prototype.toLocaleString() is supposed to delegate to Intl.DurationFormat
-        // which Deno does not support. However, instead of following specs and having toLocaleString return
-        // the same toString() it seems to have its own implementation of Intl.DurationFormat,
-        // with its options parameter type incorrectly restricted to the same as the one for Intl.DateTimeFormatOptions
-        // even though they do not share the same arguments.
-        //
-        // The above matches the options parameter of Intl.DurationFormat, and the resulting output is as expected.
-        // Until this is fixed typechecking must be disabled for the two use cases below
-        //
-        // See
-        // https://docs.deno.com/api/web/~/Intl.DateTimeFormatOptions
-        // https://docs.deno.com/api/web/~/Temporal.Duration.prototype.toLocaleString
-        // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Temporal/Duration/toLocaleString
-        // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/DurationFormat/DurationFormat
+    // Guard against an empty/blocked response masquerading as success.
+    if (!body.trimStart().toUpperCase().startsWith("WEBVTT")) {
+        throw new HTTPException(404, {
+            res: new Response("No captions available."),
+        });
+    }
 
-        const start_ms = createTemporalDuration(Number(line.start_ms)).round({
-            largestUnit: "year",
-            relativeTo: Temporal.PlainDateTime.from("2022-01-01"),
-            //@ts-ignore see above
-        }).toLocaleString("en-US", timestampFormatOptions);
-
-        const end_ms = createTemporalDuration(Number(line.end_ms)).round({
-            largestUnit: "year",
-            relativeTo: Temporal.PlainDateTime.from("2022-01-01"),
-            //@ts-ignore see above
-        }).toLocaleString("en-US", timestampFormatOptions);
-        const timestamp = `${start_ms} --> ${end_ms}`;
-
-        const text = (line.snippet?.text || "").replace(
-            /[&<>‍‍\u200E\u200F\u00A0]/g,
-            (match: string) =>
-                ESCAPE_SUBSTITUTIONS[
-                    match as keyof typeof ESCAPE_SUBSTITUTIONS
-                ],
-        );
-
-        lines.push(`${timestamp}\n${text}`);
-    });
-
-    return lines.join("\n\n");
+    return body;
 }
