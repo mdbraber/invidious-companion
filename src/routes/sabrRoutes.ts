@@ -33,6 +33,12 @@ import {
     type SabrSession,
 } from "../lib/sabr/session.ts";
 import { TrackBuffer } from "../lib/sabr/segmenter.ts";
+import {
+    diskCacheEnabled,
+    loadTrack,
+    prune,
+    saveTrack,
+} from "../lib/sabr/diskStore.ts";
 
 /** Height pulled up front; the rest of the ladder is pulled on demand. */
 const SEED_HEIGHT = Number(Deno.env.get("SABR_SEED_HEIGHT") || 360);
@@ -106,13 +112,23 @@ const audioTrackName = (trackId: string) =>
  * (measured 3.4s–7.0s), so a single duration desynchronises playback.
  */
 function timelineXml(buffer: TrackBuffer, durationSec: number) {
-    const ts = buffer.timescale ?? 1000;
-    const starts = buffer.segments.map((s) => s.baseMediaDecodeTime ?? 0);
-    const durations = starts.map((v, i) =>
-        i < starts.length - 1
-            ? starts[i + 1] - v
-            : Math.max(1, Math.round(durationSec * ts) - v)
-    );
+    // Prefer the `sidx` index: it lists every segment's duration in the init
+    // segment, so the manifest can be built from a few kilobytes rather than
+    // from `tfdt` values observed across a completed pull. The tfdt path stays
+    // as a fallback for a track whose init carries no index.
+    const ts = buffer.index?.timescale ?? buffer.timescale ?? 1000;
+    const durations = buffer.index
+        ? buffer.index.durations
+        : (() => {
+            const starts = buffer.segments.map((s) =>
+                s.baseMediaDecodeTime ?? 0
+            );
+            return starts.map((v, i) =>
+                i < starts.length - 1
+                    ? starts[i + 1] - v
+                    : Math.max(1, Math.round(durationSec * ts) - v)
+            );
+        })();
     const runs: { d: number; r: number }[] = [];
     for (const d of durations) {
         const last = runs[runs.length - 1];
@@ -201,12 +217,26 @@ ${sets.join("\n")}
 }
 
 /** Pull one track to completion in the background, returning it immediately. */
-function startTrack(
+async function startTrack(
     session: SabrSession,
     name: string,
     sel: { height?: number | null; audioTrackId?: string },
     isVideo: boolean,
 ): Promise<Track> {
+    if (diskCacheEnabled()) {
+        const cached = await loadTrack(session.videoId, name);
+        if (cached) {
+            console.log(
+                `[INFO] [sabr] [${session.videoId}] ${name} served from disk cache`,
+            );
+            return {
+                name,
+                buffer: TrackBuffer.fromFiles(cached.files),
+                ...cached.meta,
+            };
+        }
+    }
+
     return pullSabrTrack(session, sel).then(({ stream, format }) => {
         // deno-lint-ignore no-explicit-any
         const f = format as any;
@@ -224,7 +254,18 @@ function startTrack(
             ...(isVideo ? {} : { lang: sel.audioTrackId }),
         };
         // Fill in the background; segment requests wait on individual segments.
-        buffer.fill(stream).catch((err) => {
+        buffer.fill(stream).then(async () => {
+            if (!diskCacheEnabled()) return;
+            await saveTrack(session.videoId, name, buffer.files, {
+                mimeType: track.mimeType,
+                codecs: track.codecs,
+                width: track.width,
+                height: track.height,
+                bandwidth: track.bandwidth,
+                isVideo: track.isVideo,
+            });
+            await prune();
+        }).catch((err) => {
             console.log(
                 `[WARN] [sabr] [${session.videoId}] track ${name} failed: ${
                     (err as Error).message
@@ -254,49 +295,47 @@ async function prepare(
         )
         ? SEED_HEIGHT
         : session.videoRenditions[0]?.height;
-    const t0 = Date.now();
-    const seed = await startTrack(
-        session,
-        videoTrackName(seedHeight),
-        { height: seedHeight },
-        true,
-    );
-    tracks.set(seed.name, seed);
-    await seed.buffer.done;
-    log(
-        `seed video ${seedHeight}p: ${seed.buffer.segments.length} segments in ${
-            Date.now() - t0
-        }ms`,
-    );
-
     // Audio: the requested tracks, else the default one.
     const chosen = wantAudio.length
         ? session.audioTracks.filter((a) =>
             wantAudio.some((l) => a.trackId === l || a.language === l)
         )
         : [];
-    const audioList = chosen.length
-        ? chosen
-        : session.audioTracks.slice(0, 1);
+    const audioList = chosen.length ? chosen : session.audioTracks.slice(0, 1);
 
-    for (const a of audioList) {
-        const at0 = Date.now();
-        const track = await startTrack(
-            session,
-            audioTrackName(a.trackId),
-            { height: null, audioTrackId: a.trackId },
-            false,
-        );
-        track.lang = a.language;
-        track.label = a.label;
-        tracks.set(track.name, track);
-        await track.buffer.done;
-        log(
-            `audio ${a.trackId}: ${track.buffer.segments.length} segments in ${
-                Date.now() - at0
-            }ms`,
-        );
-    }
+    // Seed video and the requested audio tracks are indexed concurrently, and
+    // each only awaits its init segment — so the manifest costs about one round
+    // trip regardless of how many dubs were asked for.
+    const t0 = Date.now();
+    const [seed, audioTracks] = await Promise.all([
+        startTrack(session, videoTrackName(seedHeight), { height: seedHeight }, true)
+            .then(async (t) => {
+                await t.buffer.ready;
+                return t;
+            }),
+        Promise.all(audioList.map(async (a) => {
+            const track = await startTrack(
+                session,
+                audioTrackName(a.trackId),
+                { height: null, audioTrackId: a.trackId },
+                false,
+            );
+            track.lang = a.language;
+            track.label = a.label;
+            await track.buffer.ready;
+            return track;
+        })),
+    ]);
+
+    tracks.set(seed.name, seed);
+    for (const t of audioTracks) tracks.set(t.name, t);
+    log(
+        `indexed ${seedHeight}p (${
+            seed.buffer.index?.durations.length ?? "?"
+        } segments) + audio [${audioList.map((a) => a.trackId).join(", ")}] in ${
+            Date.now() - t0
+        }ms`,
+    );
 
     return { session, tracks, seed, pending: new Map() };
 }
