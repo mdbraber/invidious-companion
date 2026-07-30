@@ -34,6 +34,11 @@ export interface SabrAudioTrack {
     label: string;
 }
 
+export interface SabrCaptionTrack {
+    languageCode: string;
+    label: string;
+}
+
 export interface SabrVideoRendition {
     height: number;
     width?: number;
@@ -55,6 +60,13 @@ export interface SabrSession {
     poToken?: string;
     audioTracks: SabrAudioTrack[];
     videoRenditions: SabrVideoRendition[];
+    /**
+     * Advertised in the manifest, but fetched from the companion's existing
+     * `/api/v1/captions` route rather than served here: Google IP-blocks the
+     * `timedtext` base_url (HTTP 200, zero bytes), and that route already
+     * works around it.
+     */
+    captions: SabrCaptionTrack[];
     /** Which path produced this session, for logging and manifest hints. */
     mode: "web+pot" | "android_vr";
 }
@@ -97,6 +109,20 @@ async function mintPoToken(binding: string): Promise<string> {
         throw new Error(`po_token provider returned no token for ${binding}`);
     }
     return body.poToken;
+}
+
+/**
+ * One entry per language. A video commonly lists the same language twice
+ * (authored and auto-generated); the manifest keys captions by language, so a
+ * duplicate would produce two identical AdaptationSets.
+ */
+function dedupeCaptions(tracks: SabrCaptionTrack[]): SabrCaptionTrack[] {
+    const seen = new Map<string, SabrCaptionTrack>();
+    for (const t of tracks) {
+        if (!t.languageCode || seen.has(t.languageCode)) continue;
+        seen.set(t.languageCode, t);
+    }
+    return [...seen.values()];
 }
 
 // deno-lint-ignore no-explicit-any
@@ -176,6 +202,13 @@ async function openWebSession(videoId: string): Promise<SabrSession> {
         url,
         ustreamer,
         poToken,
+        captions: dedupeCaptions(
+            // deno-lint-ignore no-explicit-any
+            (info.captions?.caption_tracks ?? []).map((c: any) => ({
+                languageCode: c.language_code,
+                label: c.name?.text ?? c.language_code,
+            })),
+        ),
         clientInfo: {
             clientName: 1,
             clientVersion: innertube.session.context.client.clientVersion,
@@ -254,6 +287,16 @@ async function openVrSession(videoId: string): Promise<SabrSession> {
         formats,
         url,
         ustreamer,
+        captions: dedupeCaptions(
+            (player?.captions?.playerCaptionsTracklistRenderer
+                ?.captionTracks ?? [])
+                // deno-lint-ignore no-explicit-any
+                .map((c: any) => ({
+                    languageCode: c.languageCode,
+                    label: c.name?.simpleText ?? c.name?.runs?.[0]?.text ??
+                        c.languageCode,
+                })),
+        ),
         clientInfo: VR.clientInfo,
         userAgent: VR.userAgent,
         mode: "android_vr",
@@ -280,6 +323,12 @@ export interface SabrPullSelection {
     /** Exact video height to pull, or null for audio-only. */
     height?: number | null;
     audioTrackId?: string;
+    /**
+     * Start position, for resuming a partially cached track. Needs the seek
+     * fix in the vendored googlevideo; SABR begins at the segment *containing*
+     * this time, so the caller must expect some overlap.
+     */
+    startAtMs?: number;
 }
 
 /**
@@ -340,6 +389,7 @@ export function pullSabrTrack(
         enabledTrackTypes: wantVideo
             ? EnabledTrackTypes.VIDEO_ONLY
             : EnabledTrackTypes.AUDIO_ONLY,
+        ...(sel.startAtMs ? { startAtMs: sel.startAtMs } : {}),
         // deno-lint-ignore no-explicit-any
     } as any).then((res: any) => ({
         stream: (wantVideo

@@ -37,7 +37,8 @@ import {
     diskCacheEnabled,
     loadTrack,
     prune,
-    saveTrack,
+    saveFile,
+    saveMeta,
 } from "../lib/sabr/diskStore.ts";
 
 /** Height pulled up front; the rest of the ladder is pulled on demand. */
@@ -206,6 +207,25 @@ function buildMpdTemplate(p: Prepared, audioTracks: Track[]): string {
         }));
     }
 
+    // Captions: advertised here, served by the companion's existing
+    // /api/v1/captions route. That route already works around Google's IP
+    // block on the timedtext base_url, so duplicating it here would only
+    // reproduce the bug it exists to avoid. The URL is relative to the
+    // manifest (/…/sabr/<id>/manifest.mpd -> /…/api/v1/captions/<id>).
+    for (const cap of session.captions) {
+        const url = `../../api/v1/captions/${session.videoId}?lang=${
+            encodeURIComponent(cap.languageCode)
+        }%CHECKAMP%`;
+        sets.push(
+            `    <AdaptationSet contentType="text" mimeType="text/vtt" lang="${cap.languageCode}">
+      <Label>${cap.label.replace(/[<>&]/g, "")}</Label>
+      <Representation id="cap-${cap.languageCode}" bandwidth="0">
+        <BaseURL>${url}</BaseURL>
+      </Representation>
+    </AdaptationSet>`,
+        );
+    }
+
     return `<?xml version="1.0" encoding="utf-8"?>
 <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="urn:mpeg:dash:profile:isoff-live:2011"
      type="static" mediaPresentationDuration="PT${session.durationSec}S" minBufferTime="PT4S">
@@ -226,14 +246,40 @@ async function startTrack(
     if (diskCacheEnabled()) {
         const cached = await loadTrack(session.videoId, name);
         if (cached) {
+            const buffer = TrackBuffer.fromFiles(cached.files);
+            const missing = buffer.missingSegments();
+            if (!missing.length) {
+                console.log(
+                    `[INFO] [sabr] [${session.videoId}] ${name} served from disk cache`,
+                );
+                return { name, buffer, ...cached.meta };
+            }
+
+            // Partially cached: keep what is on disk and resume the pull at the
+            // first gap. Incoming segments are numbered by decode time, so the
+            // overlap SABR delivers before the requested position is dropped
+            // rather than misnumbered.
+            const starts = buffer.startTimes();
+            const ts = buffer.index?.timescale ?? 1000;
+            const resumeMs = Math.floor((starts[missing[0] - 1] / ts) * 1000);
             console.log(
-                `[INFO] [sabr] [${session.videoId}] ${name} served from disk cache`,
+                `[INFO] [sabr] [${session.videoId}] ${name} partially cached (${
+                    cached.files.size - 1
+                } segments); resuming at ${missing[0]} (${resumeMs}ms)`,
             );
-            return {
-                name,
-                buffer: TrackBuffer.fromFiles(cached.files),
-                ...cached.meta,
-            };
+            buffer.onPublish = (file, bytes) =>
+                void saveFile(session.videoId, name, file, bytes);
+            pullSabrTrack(session, { ...sel, startAtMs: resumeMs })
+                .then(({ stream }) => buffer.fill(stream))
+                .then(() => prune())
+                .catch((err) =>
+                    console.log(
+                        `[WARN] [sabr] [${session.videoId}] resume of ${name} failed: ${
+                            (err as Error).message
+                        }`,
+                    )
+                );
+            return { name, buffer, ...cached.meta };
         }
     }
 
@@ -253,10 +299,12 @@ async function startTrack(
             isVideo,
             ...(isVideo ? {} : { lang: sel.audioTrackId }),
         };
-        // Fill in the background; segment requests wait on individual segments.
-        buffer.fill(stream).then(async () => {
-            if (!diskCacheEnabled()) return;
-            await saveTrack(session.videoId, name, buffer.files, {
+        if (diskCacheEnabled()) {
+            // Write through, so a restart mid-pull leaves usable segments
+            // behind instead of nothing.
+            buffer.onPublish = (file, bytes) =>
+                void saveFile(session.videoId, name, file, bytes);
+            void saveMeta(session.videoId, name, {
                 mimeType: track.mimeType,
                 codecs: track.codecs,
                 width: track.width,
@@ -264,7 +312,11 @@ async function startTrack(
                 bandwidth: track.bandwidth,
                 isVideo: track.isVideo,
             });
-            await prune();
+        }
+
+        // Fill in the background; segment requests wait on individual segments.
+        buffer.fill(stream).then(async () => {
+            if (diskCacheEnabled()) await prune();
         }).catch((err) => {
             console.log(
                 `[WARN] [sabr] [${session.videoId}] track ${name} failed: ${
@@ -425,11 +477,13 @@ sabrRoutes.get("/:videoId/manifest.mpd", async (c) => {
         : "";
     c.header("content-type", "application/dash+xml");
     c.header("access-control-allow-origin", "*");
+    const checkAmp = config.server.verify_requests
+        ? `&amp;check=${encodeURIComponent(c.req.query("check") ?? "")}`
+        : "";
     return c.body(
-        buildMpdTemplate(resolved, audioTracks).replaceAll(
-            "%CHECK%",
-            checkSuffix,
-        ),
+        buildMpdTemplate(resolved, audioTracks)
+            .replaceAll("%CHECKAMP%", checkAmp)
+            .replaceAll("%CHECK%", checkSuffix),
     );
 });
 

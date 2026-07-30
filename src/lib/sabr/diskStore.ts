@@ -7,6 +7,12 @@
  * individual segments), whereas resuming one from disk means reconciling a
  * half-filled buffer with a live pull — complexity that buys little.
  *
+ * Every write is atomic (temp name + rename), so the directory is safe to share
+ * between companion instances on a common mount: a reader never sees a partial
+ * file, and concurrent writers producing identical bytes cannot corrupt each
+ * other. Two instances may redundantly pull the same track, which wastes work
+ * but not correctness.
+ *
  * Disabled unless `SABR_DISK_CACHE_DIR` is set, because the companion
  * deliberately restricts `--allow-write`: the chosen directory must be added to
  * that allow-list or every write here fails.
@@ -53,6 +59,7 @@ export async function loadTrack(
         let meta: TrackMeta | undefined;
         for await (const entry of Deno.readDir(dir)) {
             if (!entry.isFile) continue;
+            if (entry.name.startsWith(".")) continue;
             if (entry.name === META) {
                 meta = JSON.parse(
                     await Deno.readTextFile(`${dir}/${META}`),
@@ -75,32 +82,50 @@ export async function loadTrack(
     }
 }
 
-export async function saveTrack(
+/**
+ * Write a single file into a track's directory, creating it if needed.
+ *
+ * Used for write-through caching so a pull interrupted by a restart leaves
+ * usable segments behind instead of nothing. Individual files are written to a
+ * temporary name and renamed, so a reader never sees a partial file.
+ */
+export async function saveFile(
     videoId: string,
     track: string,
-    files: Map<string, Uint8Array>,
+    name: string,
+    bytes: Uint8Array,
+): Promise<void> {
+    if (!DIR || !safe(videoId) || !safe(track) || !safe(name)) return;
+    const dir = trackDir(videoId, track);
+    try {
+        await Deno.mkdir(dir, { recursive: true });
+        const tmp = `${dir}/.${name}.tmp`;
+        await Deno.writeFile(tmp, bytes);
+        await Deno.rename(tmp, `${dir}/${name}`);
+    } catch {
+        // Best-effort: a failed segment write just means a colder restart.
+    }
+}
+
+/** Record the metadata that cannot be recovered from the bytes. */
+export async function saveMeta(
+    videoId: string,
+    track: string,
     meta: TrackMeta,
 ): Promise<void> {
     if (!DIR || !safe(videoId) || !safe(track)) return;
     const dir = trackDir(videoId, track);
-    // Write to a temporary directory and rename, so a crash mid-write cannot
-    // leave a half-written track that later looks complete.
-    const tmp = `${dir}.tmp-${performance.now().toString(36).replace(".", "")}`;
     try {
-        await Deno.mkdir(tmp, { recursive: true });
-        for (const [name, bytes] of files) {
-            await Deno.writeFile(`${tmp}/${name}`, bytes);
-        }
-        await Deno.writeTextFile(`${tmp}/${META}`, JSON.stringify(meta));
-        await Deno.remove(dir, { recursive: true }).catch(() => {});
-        await Deno.rename(tmp, dir);
+        await Deno.mkdir(dir, { recursive: true });
+        const tmp = `${dir}/.${META}.tmp`;
+        await Deno.writeTextFile(tmp, JSON.stringify(meta));
+        await Deno.rename(tmp, `${dir}/${META}`);
     } catch (err) {
         console.log(
             `[WARN] [sabr] disk cache write failed for ${videoId}/${track}: ${
                 (err as Error).message
             } (is ${DIR} in --allow-write?)`,
         );
-        await Deno.remove(tmp, { recursive: true }).catch(() => {});
     }
 }
 

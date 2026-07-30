@@ -128,6 +128,11 @@ export class TrackBuffer {
     error?: Error;
     bytes = 0;
 
+    /** Called for each file as it is published, for write-through caching. */
+    onPublish?: (name: string, bytes: Uint8Array) => void;
+    /** Segment numbers already present before filling (from a cache). */
+    private preloaded = new Set<number>();
+
     private waiters = new Map<string, Array<() => void>>();
     private resolveDone!: () => void;
     private rejectDone!: (e: Error) => void;
@@ -151,8 +156,10 @@ export class TrackBuffer {
     }
 
     private publish(name: string, bytes: Uint8Array) {
+        if (this.files.has(name)) return;
         this.files.set(name, bytes);
         this.bytes += bytes.length;
+        this.onPublish?.(name, bytes);
         const w = this.waiters.get(name);
         if (w) {
             this.waiters.delete(name);
@@ -193,6 +200,44 @@ export class TrackBuffer {
         return this.files.get(name);
     }
 
+    /** Segment start times in index timescale units, cumulative from 0. */
+    startTimes(): number[] {
+        if (!this.index) return [];
+        const out: number[] = [];
+        let acc = 0;
+        for (const d of this.index.durations) {
+            out.push(acc);
+            acc += d;
+        }
+        return out;
+    }
+
+    /** Which segments the index says exist but this buffer does not hold. */
+    missingSegments(): number[] {
+        if (!this.index) return [];
+        const missing: number[] = [];
+        for (let n = 1; n <= this.index.durations.length; n++) {
+            if (!this.files.has(`seg-${n}.m4s`)) missing.push(n);
+        }
+        return missing;
+    }
+
+    /**
+     * The segment number whose start time matches `decodeTime`, or undefined.
+     *
+     * A resumed pull does not necessarily begin on the segment we asked for —
+     * SABR starts at the segment *containing* the requested time — so incoming
+     * segments are numbered by matching their `tfdt` against the index rather
+     * than counted sequentially. Tolerance is one tick to absorb rounding.
+     */
+    numberForDecodeTime(decodeTime: number): number | undefined {
+        const starts = this.startTimes();
+        for (let i = 0; i < starts.length; i++) {
+            if (Math.abs(starts[i] - decodeTime) <= 1) return i + 1;
+        }
+        return undefined;
+    }
+
     /** Pre-fill from a cache; the track is complete on return. */
     static fromFiles(files: Map<string, Uint8Array>): TrackBuffer {
         const tb = new TrackBuffer();
@@ -200,17 +245,26 @@ export class TrackBuffer {
         for (const [name, bytes] of files) {
             tb.files.set(name, bytes);
             tb.bytes += bytes.length;
+            const m = /^seg-(\d+)\.m4s$/.exec(name);
+            if (m) tb.preloaded.add(Number(m[1]));
         }
         if (init) {
             tb.timescale = findTimescale(Buffer.from(init));
             tb.index = parseSidx(init);
         }
-        // Segment numbers are implied by the index; the tfdt fallback is not
-        // reconstructed because a cached track always has its sidx.
-        tb.complete = true;
         tb.resolveReady();
-        tb.resolveDone();
+        // Complete only if every segment the index promises is present. A
+        // partially cached track stays open so the caller can resume it.
+        if (tb.missingSegments().length === 0) {
+            tb.complete = true;
+            tb.resolveDone();
+        }
         return tb;
+    }
+
+    /** True when the track was loaded from cache but is not whole. */
+    isPartial(): boolean {
+        return this.preloaded.size > 0 && !this.complete;
     }
 
     /** Consume a pulled fMP4 stream, publishing segments as they complete. */
@@ -233,7 +287,7 @@ export class TrackBuffer {
                         init = Buffer.concat(headerBoxes);
                         this.timescale = findTimescale(init);
                         const bytes = new Uint8Array(init);
-                        this.index = parseSidx(bytes);
+                        this.index = parseSidx(bytes) ?? this.index;
                         this.publish("init.mp4", bytes);
                         // The manifest can be built from here; the rest of the
                         // pull continues in the background.
@@ -245,15 +299,22 @@ export class TrackBuffer {
                 } else if (box.type === "moof") {
                     pendingMoof = Buffer.from(raw);
                 } else if (box.type === "mdat" && pendingMoof) {
-                    const number = this.segments.length + 1;
+                    const decodeTime = findBaseMediaDecodeTime(pendingMoof);
+                    // Number by decode time when the index allows it: a resumed
+                    // pull starts at the segment containing the requested time,
+                    // which is not necessarily the one we asked for, so
+                    // counting arrivals would misnumber everything after it.
+                    const number = (decodeTime !== undefined
+                        ? this.numberForDecodeTime(decodeTime)
+                        : undefined) ?? this.segments.length + 1;
                     const seg = Buffer.concat([pendingMoof, raw]);
                     this.segments.push({
                         number,
                         bytes: seg.length,
-                        baseMediaDecodeTime: findBaseMediaDecodeTime(
-                            pendingMoof,
-                        ),
+                        baseMediaDecodeTime: decodeTime,
                     });
+                    // publish() ignores a name it already holds, so segments
+                    // re-delivered by an overlapping resume are dropped.
                     this.publish(`seg-${number}.m4s`, new Uint8Array(seg));
                     pendingMoof = null;
                 }
@@ -273,11 +334,24 @@ export class TrackBuffer {
             flush();
             this.complete = true;
             this.releaseAll();
-            if (!init) {
+            if (!init && !this.index) {
                 this.rejectReady(new Error("stream produced no init segment"));
             }
             this.resolveDone();
+            return;
         } catch (err) {
+            // A resumed pull ends with googlevideo complaining that it never
+            // delivered the segments we already had on disk ("Missing
+            // segments: [1..72]"). The index is the authority on completeness,
+            // not the library's own accounting — so if every segment the sidx
+            // promises is present, this is a success.
+            flush();
+            if (this.index && this.missingSegments().length === 0) {
+                this.complete = true;
+                this.releaseAll();
+                this.resolveDone();
+                return;
+            }
             this.error = err as Error;
             this.releaseAll();
             this.rejectReady(this.error);
