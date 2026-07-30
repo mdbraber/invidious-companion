@@ -1,26 +1,41 @@
 /**
  * SABR→DASH connector routes.
  *
- * Serves ordinary DASH — manifest, init segment, numbered media segments — by
- * pulling YouTube's SABR protocol server-side and cutting the fMP4 stream on
- * `moof` boundaries. Segmentation only: no re-muxing, no transcode.
+ * Serves ordinary DASH by pulling YouTube's SABR protocol server-side and
+ * cutting the fMP4 stream on `moof` boundaries. Segmentation only: no
+ * re-muxing, no transcode.
  *
  *   GET /sabr/:videoId/manifest.mpd[?audio=de,fr][?check=]
  *   GET /sabr/:videoId/:track/:file[?check=]
+ *   GET /sabr/:videoId/download[?itag=][?check=]
  *
- * Track names are `v<height>` and `a-<trackId>`.
+ * **Nothing is cached.** Manifests are built from the `sidx` index carried in
+ * each track's init segment, and segments come from short-lived readers
+ * positioned in a live SABR stream. Random access costs 39–88ms, so storing
+ * whole videos to avoid it was never a good trade — and it turned the cache
+ * directory into a watch history with the content attached. A consequence
+ * worth having: abandoning playback stops the download, instead of quietly
+ * fetching the rest of the video.
  *
- * **Only one representation is pulled up front.** The manifest advertises the
- * whole quality ladder, but the timeline is shared: fragment boundaries are
- * byte-identical across heights (verified — 288 fragments, 0.0000s drift
- * between 144p and 720p), because they are cut from the same source encode. A
- * height other than the seed is pulled on first request for one of its
- * segments, and its segments are served *as they arrive* rather than after the
- * whole track finishes.
+ * Live and post-live DVR are **delegated** to the companion's existing
+ * `/api/manifest/dash/id` route. Note this is a pragmatic choice, not a
+ * protocol limit: SABR does carry live, and yt-dlp implements it (~180
+ * references to broadcast handling — head tracking, end detection, deep
+ * rewind, seekable-range and target-duration logic). What we lack is that
+ * subsystem in `SabrStream`, the headless downloader here, which has none of
+ * it and simply stalls. Meanwhile YouTube publishes a native dynamic DASH
+ * manifest for live, and the companion route already serves it including the
+ * fresh-token handling post-live DVR needs — so reimplementing it would be a
+ * lot of work to arrive back where we already are.
+ *
+ * Delegation triggers on either signal: the player response says live, or the
+ * track has no `sidx`. The second matters because a post-live recording that
+ * *does* carry an index is served here as ordinary VOD, rather than being
+ * excluded by its label.
  *
  * When `server.verify_requests` is on, every route requires the same
  * AES-encrypted `check` parameter the other companion routes use, and the
- * manifest embeds it in the segment URLs it hands the player.
+ * manifest embeds it in the URLs it hands the player.
  */
 import { type Context, Hono } from "hono";
 import type { HonoVariables } from "../lib/types/HonoVariables.ts";
@@ -29,30 +44,28 @@ import { verifyRequest } from "../lib/helpers/verifyRequest.ts";
 import { validateVideoId } from "../lib/helpers/validateVideoId.ts";
 import {
     openSabrSession,
-    pullSabrTrack,
+    type SabrPullSelection,
     type SabrSession,
 } from "../lib/sabr/session.ts";
-import { TrackBuffer } from "../lib/sabr/segmenter.ts";
 import {
-    diskCacheEnabled,
-    loadTrack,
-    prune,
-    saveFile,
-    saveMeta,
-} from "../lib/sabr/diskStore.ts";
+    fetchTrackIndex,
+    ReaderPool,
+    type TrackIndex,
+} from "../lib/sabr/reader.ts";
 
-/** Height pulled up front; the rest of the ladder is pulled on demand. */
+/** Height indexed up front; other renditions are indexed on first request. */
 const SEED_HEIGHT = Number(Deno.env.get("SABR_SEED_HEIGHT") || 360);
-/** Ceiling on advertised heights, so a manifest cannot promise 4K by accident. */
 const MAX_HEIGHT = Number(Deno.env.get("SABR_MAX_HEIGHT") || 1080);
-/** Total bytes of prepared media held in memory before evicting. */
-const CACHE_BYTES = Number(Deno.env.get("SABR_CACHE_MB") || 512) * 1024 * 1024;
-/** How long a segment request waits for a still-arriving segment. */
 const SEGMENT_WAIT_MS = Number(Deno.env.get("SABR_SEGMENT_WAIT_MS") || 30_000);
+/** How long a player response is reused. The streaming URL is valid ~6h. */
+const SESSION_TTL_MS = Number(
+    Deno.env.get("SABR_SESSION_TTL_MS") || 4 * 3600_000,
+);
 
-interface Track {
+interface TrackInfo {
     name: string;
-    buffer: TrackBuffer;
+    sel: SabrPullSelection;
+    index: TrackIndex;
     mimeType: string;
     codecs: string;
     width?: number;
@@ -65,39 +78,18 @@ interface Track {
 
 interface Prepared {
     session: SabrSession;
-    /** Track name -> track. Grows as representations are pulled on demand. */
-    tracks: Map<string, Track>;
-    /** The seed video track, whose timeline every video rendition shares. */
-    seed: Track;
-    /** In-flight lazy pulls, so concurrent requests share one pull. */
-    pending: Map<string, Promise<Track>>;
+    at: number;
+    /** Indexed tracks. An index is kilobytes; no media is held. */
+    tracks: Map<string, TrackInfo>;
+    seed?: TrackInfo;
+    pending: Map<string, Promise<TrackInfo>>;
+    /** Serve this video from the native DASH route instead. */
+    delegate?: boolean;
 }
 
-const prepared = new Map<string, Promise<Prepared>>();
-
-const cachedBytes = async () => {
-    let total = 0;
-    for (const p of prepared.values()) {
-        try {
-            const { tracks } = await p;
-            for (const t of tracks.values()) total += t.buffer.bytes;
-        } catch {
-            // A failed preparation holds nothing.
-        }
-    }
-    return total;
-};
-
-/** Evict least-recently-used videos until the cache fits its byte budget. */
-async function enforceBudget(keep: string) {
-    while (prepared.size > 1 && (await cachedBytes()) > CACHE_BYTES) {
-        for (const key of prepared.keys()) {
-            if (key === keep) continue;
-            prepared.delete(key);
-            break;
-        }
-    }
-}
+/** Player responses and track indexes only — no media. */
+const sessions = new Map<string, Promise<Prepared>>();
+const readers = new ReaderPool();
 
 const parseCodec = (mime?: string) => ({
     base: (mime ?? "").split(";")[0],
@@ -112,36 +104,16 @@ const audioTrackName = (trackId: string) =>
  * `SegmentTimeline`, not a fixed `duration`: SABR's fragments are not uniform
  * (measured 3.4s–7.0s), so a single duration desynchronises playback.
  */
-function timelineXml(buffer: TrackBuffer, durationSec: number) {
-    // Prefer the `sidx` index: it lists every segment's duration in the init
-    // segment, so the manifest can be built from a few kilobytes rather than
-    // from `tfdt` values observed across a completed pull. The tfdt path stays
-    // as a fallback for a track whose init carries no index.
-    const ts = buffer.index?.timescale ?? buffer.timescale ?? 1000;
-    const durations = buffer.index
-        ? buffer.index.durations
-        : (() => {
-            const starts = buffer.segments.map((s) =>
-                s.baseMediaDecodeTime ?? 0
-            );
-            return starts.map((v, i) =>
-                i < starts.length - 1
-                    ? starts[i + 1] - v
-                    : Math.max(1, Math.round(durationSec * ts) - v)
-            );
-        })();
+function timelineXml(index: TrackIndex) {
     const runs: { d: number; r: number }[] = [];
-    for (const d of durations) {
+    for (const d of index.durations) {
         const last = runs[runs.length - 1];
         if (last && last.d === d) last.r++;
         else runs.push({ d, r: 0 });
     }
-    return {
-        ts,
-        xml: runs.map((x) =>
-            `          <S d="${x.d}"${x.r ? ` r="${x.r}"` : ""}/>`
-        ).join("\n"),
-    };
+    return runs.map((x) =>
+        `          <S d="${x.d}"${x.r ? ` r="${x.r}"` : ""}/>`
+    ).join("\n");
 }
 
 function adaptationSet(opts: {
@@ -165,16 +137,18 @@ ${opts.representations}
     </AdaptationSet>`;
 }
 
-function buildMpdTemplate(p: Prepared, audioTracks: Track[]): string {
-    const { session, seed } = p;
+function buildMpdTemplate(p: Prepared, audioTracks: TrackInfo[]): string {
+    const { session } = p;
+    const seed = p.seed!;
     const sets: string[] = [];
 
-    // One video AdaptationSet holding the whole ladder. Every rendition shares
-    // the seed's timeline — the fragment boundaries are identical across
-    // heights, so `$RepresentationID$` in the template is enough to address
-    // them and only the seed has to have been pulled.
+    // One video AdaptationSet holding the whole ladder, every rendition sharing
+    // the seed's timeline: fragment boundaries are identical across heights
+    // (verified — 288 fragments, 0.0000s drift between 144p and 720p) because
+    // they are cut from the same source encode. So only the seed needs
+    // indexing, and a mid-playback bitrate switch is just a request for a
+    // different Representation — no extra pull, nothing retained.
     {
-        const tl = timelineXml(seed.buffer, session.durationSec);
         const reps = session.videoRenditions
             .filter((r) => r.height <= MAX_HEIGHT)
             .map((r) => {
@@ -185,42 +159,35 @@ function buildMpdTemplate(p: Prepared, audioTracks: Track[]): string {
             }).join("\n");
         sets.push(adaptationSet({
             mimeType: seed.mimeType,
-            timescale: tl.ts,
-            timeline: tl.xml,
+            timescale: seed.index.timescale,
+            timeline: timelineXml(seed.index),
             representations: reps,
         }));
     }
 
-    // One AdaptationSet per audio track, each with its own timeline (audio
-    // fragmentation differs from video and between tracks).
     for (const t of audioTracks) {
-        const tl = timelineXml(t.buffer, session.durationSec);
-        const rep =
-            `      <Representation id="${t.name}" codecs="${t.codecs}" audioSamplingRate="${tl.ts}" bandwidth="${t.bandwidth}"/>`;
         sets.push(adaptationSet({
             mimeType: t.mimeType,
             lang: t.lang,
             label: t.label,
-            timescale: tl.ts,
-            timeline: tl.xml,
-            representations: rep,
+            timescale: t.index.timescale,
+            timeline: timelineXml(t.index),
+            representations:
+                `      <Representation id="${t.name}" codecs="${t.codecs}" audioSamplingRate="${t.index.timescale}" bandwidth="${t.bandwidth}"/>`,
         }));
     }
 
     // Captions: advertised here, served by the companion's existing
-    // /api/v1/captions route. That route already works around Google's IP
-    // block on the timedtext base_url, so duplicating it here would only
-    // reproduce the bug it exists to avoid. The URL is relative to the
-    // manifest (/…/sabr/<id>/manifest.mpd -> /…/api/v1/captions/<id>).
+    // /api/v1/captions route, which already works around Google's IP block on
+    // the timedtext base_url.
     for (const cap of session.captions) {
-        const url = `../../api/v1/captions/${session.videoId}?lang=${
-            encodeURIComponent(cap.languageCode)
-        }%CHECKAMP%`;
         sets.push(
             `    <AdaptationSet contentType="text" mimeType="text/vtt" lang="${cap.languageCode}">
       <Label>${cap.label.replace(/[<>&]/g, "")}</Label>
       <Representation id="cap-${cap.languageCode}" bandwidth="0">
-        <BaseURL>${url}</BaseURL>
+        <BaseURL>../../api/v1/captions/${session.videoId}?lang=${
+                encodeURIComponent(cap.languageCode)
+            }%CHECKAMP%</BaseURL>
       </Representation>
     </AdaptationSet>`,
         );
@@ -236,118 +203,60 @@ ${sets.join("\n")}
 `;
 }
 
-/** Pull one track to completion in the background, returning it immediately. */
-async function startTrack(
+async function indexTrack(
     session: SabrSession,
     name: string,
-    sel: { height?: number | null; audioTrackId?: string },
+    sel: SabrPullSelection,
     isVideo: boolean,
-): Promise<Track> {
-    if (diskCacheEnabled()) {
-        const cached = await loadTrack(session.videoId, name);
-        if (cached) {
-            const buffer = TrackBuffer.fromFiles(cached.files);
-            const missing = buffer.missingSegments();
-            if (!missing.length) {
-                console.log(
-                    `[INFO] [sabr] [${session.videoId}] ${name} served from disk cache`,
-                );
-                return { name, buffer, ...cached.meta };
-            }
-
-            // Partially cached: keep what is on disk and resume the pull at the
-            // first gap. Incoming segments are numbered by decode time, so the
-            // overlap SABR delivers before the requested position is dropped
-            // rather than misnumbered.
-            const starts = buffer.startTimes();
-            const ts = buffer.index?.timescale ?? 1000;
-            const resumeMs = Math.floor((starts[missing[0] - 1] / ts) * 1000);
-            console.log(
-                `[INFO] [sabr] [${session.videoId}] ${name} partially cached (${
-                    cached.files.size - 1
-                } segments); resuming at ${missing[0]} (${resumeMs}ms)`,
-            );
-            buffer.onPublish = (file, bytes) =>
-                void saveFile(session.videoId, name, file, bytes);
-            pullSabrTrack(session, { ...sel, startAtMs: resumeMs })
-                .then(({ stream }) => buffer.fill(stream))
-                .then(() => prune())
-                .catch((err) =>
-                    console.log(
-                        `[WARN] [sabr] [${session.videoId}] resume of ${name} failed: ${
-                            (err as Error).message
-                        }`,
-                    )
-                );
-            return { name, buffer, ...cached.meta };
-        }
-    }
-
-    return pullSabrTrack(session, sel).then(({ stream, format }) => {
-        // deno-lint-ignore no-explicit-any
-        const f = format as any;
-        const c = parseCodec(f.mimeType);
-        const buffer = new TrackBuffer();
-        const track: Track = {
-            name,
-            buffer,
-            mimeType: c.base,
-            codecs: c.codecs,
-            width: f.width,
-            height: f.height,
-            bandwidth: Number(f.bitrate ?? 0),
-            isVideo,
-            ...(isVideo ? {} : { lang: sel.audioTrackId }),
-        };
-        if (diskCacheEnabled()) {
-            // Write through, so a restart mid-pull leaves usable segments
-            // behind instead of nothing.
-            buffer.onPublish = (file, bytes) =>
-                void saveFile(session.videoId, name, file, bytes);
-            void saveMeta(session.videoId, name, {
-                mimeType: track.mimeType,
-                codecs: track.codecs,
-                width: track.width,
-                height: track.height,
-                bandwidth: track.bandwidth,
-                isVideo: track.isVideo,
-            });
-        }
-
-        // Fill in the background; segment requests wait on individual segments.
-        buffer.fill(stream).then(async () => {
-            if (diskCacheEnabled()) await prune();
-        }).catch((err) => {
-            console.log(
-                `[WARN] [sabr] [${session.videoId}] track ${name} failed: ${
-                    (err as Error).message
-                }`,
-            );
-        });
-        return track;
-    });
+): Promise<TrackInfo> {
+    const { index, format } = await fetchTrackIndex(session, sel);
+    // deno-lint-ignore no-explicit-any
+    const f = format as any;
+    const c = parseCodec(f.mimeType);
+    return {
+        name,
+        sel,
+        index,
+        mimeType: c.base,
+        codecs: c.codecs,
+        width: f.width,
+        height: f.height,
+        bandwidth: Number(f.bitrate ?? 0),
+        isVideo,
+    };
 }
 
 async function prepare(
     videoId: string,
     wantAudio: string[],
 ): Promise<Prepared> {
-    const session = await openSabrSession(videoId);
+    // A specific audio track was asked for, so the session must be able to
+    // offer more than the original — worth the WEB+pot latency. Otherwise
+    // ANDROID_VR, which is ~60x faster to index and seek.
+    const session = await openSabrSession(videoId, wantAudio.length > 0);
     const log = (m: string) => console.log(`[INFO] [sabr] [${videoId}] ${m}`);
+
+    if (session.isLive) {
+        log("live/post-live — delegating to /api/manifest/dash/id");
+        return {
+            session,
+            at: Date.now(),
+            tracks: new Map(),
+            pending: new Map(),
+            delegate: true,
+        };
+    }
+
     log(
         `"${session.title}" ${session.durationSec}s — mode=${session.mode}, ${session.videoRenditions.length} rendition(s), ${session.audioTracks.length} audio track(s)`,
     );
 
-    const tracks = new Map<string, Track>();
-
-    // Seed video: the one rendition pulled up front, and the timeline every
-    // other rendition borrows.
     const seedHeight = session.videoRenditions.some((r) =>
             r.height === SEED_HEIGHT
         )
         ? SEED_HEIGHT
         : session.videoRenditions[0]?.height;
-    // Audio: the requested tracks, else the default one.
+
     const chosen = wantAudio.length
         ? session.audioTracks.filter((a) =>
             wantAudio.some((l) => a.trackId === l || a.language === l)
@@ -355,48 +264,80 @@ async function prepare(
         : [];
     const audioList = chosen.length ? chosen : session.audioTracks.slice(0, 1);
 
-    // Seed video and the requested audio tracks are indexed concurrently, and
-    // each only awaits its init segment — so the manifest costs about one round
-    // trip regardless of how many dubs were asked for.
     const t0 = Date.now();
-    const [seed, audioTracks] = await Promise.all([
-        startTrack(session, videoTrackName(seedHeight), { height: seedHeight }, true)
-            .then(async (t) => {
-                await t.buffer.ready;
+    let seed: TrackInfo;
+    let audioTracks: TrackInfo[];
+    try {
+        [seed, audioTracks] = await Promise.all([
+            indexTrack(session, videoTrackName(seedHeight), {
+                height: seedHeight,
+            }, true),
+            Promise.all(audioList.map(async (a) => {
+                const t = await indexTrack(
+                    session,
+                    audioTrackName(a.trackId),
+                    { height: null, audioTrackId: a.trackId },
+                    false,
+                );
+                t.lang = a.language;
+                t.label = a.label;
                 return t;
-            }),
-        Promise.all(audioList.map(async (a) => {
-            const track = await startTrack(
-                session,
-                audioTrackName(a.trackId),
-                { height: null, audioTrackId: a.trackId },
-                false,
-            );
-            track.lang = a.language;
-            track.label = a.label;
-            await track.buffer.ready;
-            return track;
-        })),
-    ]);
+            })),
+        ]);
+    } catch (err) {
+        // No index means nothing to build a static timeline from — a live
+        // recording the player response did not label as such, most likely.
+        log(
+            `no segment index (${
+                (err as Error).message
+            }) — delegating to /api/manifest/dash/id`,
+        );
+        return {
+            session,
+            at: Date.now(),
+            tracks: new Map(),
+            pending: new Map(),
+            delegate: true,
+        };
+    }
 
+    const tracks = new Map<string, TrackInfo>();
     tracks.set(seed.name, seed);
     for (const t of audioTracks) tracks.set(t.name, t);
     log(
-        `indexed ${seedHeight}p (${
-            seed.buffer.index?.durations.length ?? "?"
-        } segments) + audio [${audioList.map((a) => a.trackId).join(", ")}] in ${
-            Date.now() - t0
-        }ms`,
+        `indexed ${seedHeight}p (${seed.index.durations.length} segments) + audio [${
+            audioList.map((a) => a.trackId).join(", ")
+        }] in ${Date.now() - t0}ms`,
     );
 
-    return { session, tracks, seed, pending: new Map() };
+    return { session, at: Date.now(), tracks, seed, pending: new Map() };
 }
 
-/**
- * Pull a rendition that was advertised but not prepared, once. Concurrent
- * requests for the same track share the pull.
- */
-function ensureTrack(p: Prepared, name: string): Promise<Track> | undefined {
+function getPrepared(videoId: string, audio: string[]): Promise<Prepared> {
+    const key = `${videoId}|${audio.join(",")}`;
+
+    const refresh = (): Promise<Prepared> => {
+        const p = prepare(videoId, audio).catch((e) => {
+            sessions.delete(key);
+            throw e;
+        });
+        sessions.set(key, p);
+        return p;
+    };
+
+    const existing = sessions.get(key);
+    if (!existing) return refresh();
+    // A stale player response hands out expired streaming URLs.
+    return existing
+        .then((p) => (Date.now() - p.at < SESSION_TTL_MS ? p : refresh()))
+        .catch(() => refresh());
+}
+
+/** Index a rendition that was advertised but not yet indexed. */
+function ensureTrack(
+    p: Prepared,
+    name: string,
+): Promise<TrackInfo> | undefined {
     const existing = p.tracks.get(name);
     if (existing) return Promise.resolve(existing);
     const inFlight = p.pending.get(name);
@@ -409,10 +350,7 @@ function ensureTrack(p: Prepared, name: string): Promise<Track> | undefined {
         return undefined;
     }
 
-    console.log(
-        `[INFO] [sabr] [${p.session.videoId}] pulling ${height}p on demand`,
-    );
-    const promise = startTrack(p.session, name, { height }, true)
+    const promise = indexTrack(p.session, name, { height }, true)
         .then((t) => {
             p.tracks.set(name, t);
             p.pending.delete(name);
@@ -427,7 +365,6 @@ function ensureTrack(p: Prepared, name: string): Promise<Track> | undefined {
 }
 
 const sabrRoutes = new Hono<{ Variables: HonoVariables }>();
-
 type Ctx = Context<{ Variables: HonoVariables }>;
 
 const guard = (c: Ctx): string => {
@@ -450,56 +387,81 @@ const guard = (c: Ctx): string => {
     return videoId;
 };
 
+const checkSuffixes = (c: Ctx) => {
+    const config = c.get("config");
+    const check = c.req.query("check") ?? "";
+    return config.server.verify_requests
+        ? {
+            q: `?check=${encodeURIComponent(check)}`,
+            amp: `&amp;check=${encodeURIComponent(check)}`,
+        }
+        : { q: "", amp: "" };
+};
+
 sabrRoutes.get("/:videoId/manifest.mpd", async (c) => {
     const videoId = guard(c);
-    const config = c.get("config");
     const audio = (c.req.query("audio") ?? "").split(",").map((s) => s.trim())
         .filter(Boolean);
 
-    // Audio selection changes what the manifest contains, so it keys the cache.
-    const key = `${videoId}|${audio.join(",")}`;
-    let p = prepared.get(key);
-    if (!p) {
-        p = prepare(videoId, audio).catch((e) => {
-            prepared.delete(key);
-            throw e;
-        });
-    }
-    prepared.delete(key);
-    prepared.set(key, p);
+    const resolved = await getPrepared(videoId, audio);
+    const { q, amp } = checkSuffixes(c);
 
-    const resolved = await p;
-    await enforceBudget(key);
+    // Live / post-live DVR, or anything without an index: hand off to the
+    // route that already does this well.
+    if (resolved.delegate) {
+        return c.redirect(`../../api/manifest/dash/id/${videoId}${q}`, 302);
+    }
 
     const audioTracks = [...resolved.tracks.values()].filter((t) => !t.isVideo);
-    const checkSuffix = config.server.verify_requests
-        ? `?check=${encodeURIComponent(c.req.query("check") ?? "")}`
-        : "";
     c.header("content-type", "application/dash+xml");
     c.header("access-control-allow-origin", "*");
-    const checkAmp = config.server.verify_requests
-        ? `&amp;check=${encodeURIComponent(c.req.query("check") ?? "")}`
-        : "";
     return c.body(
         buildMpdTemplate(resolved, audioTracks)
-            .replaceAll("%CHECKAMP%", checkAmp)
-            .replaceAll("%CHECK%", checkSuffix),
+            .replaceAll("%CHECKAMP%", amp)
+            .replaceAll("%CHECK%", q),
     );
+});
+
+/**
+ * A whole-file download, for clients that want one file rather than a manifest
+ * — a podcast app fetching an RSS enclosure, for instance.
+ *
+ * Delegates to the companion's existing `/latest_version`, which serves a
+ * muxed progressive file through the videoplayback proxy and already supports
+ * Range requests and resumption. Muxing the separate SABR video and audio
+ * tracks here would need a real muxer, for no benefit while muxed itag 18
+ * exists. `itag=140` gives audio only, which is what a podcast feed wants.
+ */
+sabrRoutes.get("/:videoId/download", (c) => {
+    const videoId = guard(c);
+    const config = c.get("config");
+    const itag = c.req.query("itag") ?? "18";
+    if (!/^\d+$/.test(itag)) {
+        throw new HTTPException(400, { res: new Response("Invalid itag.") });
+    }
+    const params = new URLSearchParams({ id: videoId, itag, local: "true" });
+    const check = c.req.query("check");
+    if (config.server.verify_requests && check) params.set("check", check);
+    const title = c.req.query("title");
+    if (title) params.set("title", title);
+    return c.redirect(`../../latest_version?${params.toString()}`, 302);
 });
 
 sabrRoutes.get("/:videoId/:track/:file", async (c) => {
     const videoId = guard(c);
     const { track, file } = c.req.param();
-    if (!/^(init\.mp4|seg-\d+\.m4s)$/.test(file)) {
+    const isInit = file === "init.mp4";
+    const segMatch = /^seg-(\d+)\.m4s$/.exec(file);
+    if (!isInit && !segMatch) {
         throw new HTTPException(400, {
             res: new Response("Invalid segment name."),
         });
     }
 
-    // Segments are only served against a preparation the manifest request
-    // started; a segment request never opens a new video.
+    // The audio selection is not in this URL, so match any preparation of this
+    // video — video renditions are identical across audio selections.
     let entry: Promise<Prepared> | undefined;
-    for (const [k, v] of prepared) {
+    for (const [k, v] of sessions) {
         if (k === videoId || k.startsWith(`${videoId}|`)) entry = v;
     }
     if (!entry) {
@@ -513,27 +475,33 @@ sabrRoutes.get("/:videoId/:track/:file", async (c) => {
     if (!trackPromise) {
         throw new HTTPException(404, { res: new Response("No such track.") });
     }
-
     const t = await trackPromise;
-    const bytes = await t.buffer.get(file, SEGMENT_WAIT_MS);
-    if (!bytes) {
-        // Distinguish "still coming" from "will never exist": a completed track
-        // that lacks the file genuinely does not have it.
-        if (t.buffer.complete || t.buffer.error) {
-            throw new HTTPException(404, {
-                res: new Response("No such segment."),
-            });
-        }
-        throw new HTTPException(503, {
-            res: new Response("Segment not ready yet; retry."),
-        });
+
+    c.header("access-control-allow-origin", "*");
+    if (isInit) {
+        c.header("content-type", "video/mp4");
+        c.header("cache-control", "private, max-age=3600");
+        return c.body(t.index.init);
     }
 
-    c.header(
-        "content-type",
-        file === "init.mp4" ? "video/mp4" : "video/iso.segment",
+    const n = Number(segMatch![1]);
+    if (n < 1 || n > t.index.durations.length) {
+        throw new HTTPException(404, { res: new Response("No such segment.") });
+    }
+    const bytes = await readers.segment(
+        `${videoId}|${track}`,
+        p.session,
+        t.sel,
+        t.index,
+        n,
+        SEGMENT_WAIT_MS,
     );
-    c.header("access-control-allow-origin", "*");
+    if (!bytes) {
+        throw new HTTPException(503, {
+            res: new Response("Segment not ready; retry."),
+        });
+    }
+    c.header("content-type", "video/iso.segment");
     c.header("cache-control", "private, max-age=3600");
     return c.body(bytes);
 });

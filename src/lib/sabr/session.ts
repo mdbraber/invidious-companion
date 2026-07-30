@@ -67,6 +67,12 @@ export interface SabrSession {
      * works around it.
      */
     captions: SabrCaptionTrack[];
+    /**
+     * Live or post-live DVR. Neither has a stable segment index, and a live
+     * SABR pull stalls out — these are delegated to the companion's existing
+     * DASH manifest route, which serves YouTube's native dynamic manifest.
+     */
+    isLive: boolean;
     /** Which path produced this session, for logging and manifest hints. */
     mode: "web+pot" | "android_vr";
 }
@@ -213,6 +219,9 @@ async function openWebSession(videoId: string): Promise<SabrSession> {
             clientName: 1,
             clientVersion: innertube.session.context.client.clientVersion,
         },
+        isLive: Boolean(
+            info.basic_info?.is_live || info.basic_info?.is_post_live_dvr,
+        ),
         mode: "web+pot",
         ...describeTracks(formats),
     };
@@ -299,13 +308,31 @@ async function openVrSession(videoId: string): Promise<SabrSession> {
         ),
         clientInfo: VR.clientInfo,
         userAgent: VR.userAgent,
+        isLive: Boolean(
+            player?.videoDetails?.isLive ||
+                player?.videoDetails?.isPostLiveDvr ||
+                player?.videoDetails?.isLiveContent &&
+                    !parseInt(player?.videoDetails?.lengthSeconds ?? "0"),
+        ),
         mode: "android_vr",
         ...describeTracks(formats),
     };
 }
 
-export async function openSabrSession(videoId: string): Promise<SabrSession> {
-    if (POT_URL) {
+/**
+ * ANDROID_VR is preferred, and it is not close: measured against the same
+ * video, indexing a track takes **69ms** on ANDROID_VR versus **4.1s** on
+ * WEB+pot, and a seek 27–115ms versus ~4s. WEB is only worth that cost when
+ * the request needs something ANDROID_VR cannot express — a dubbed audio
+ * track, which its player response does not list at all.
+ *
+ * @param needsFullFormats ask for WEB+pot because a dub was requested.
+ */
+export async function openSabrSession(
+    videoId: string,
+    needsFullFormats = false,
+): Promise<SabrSession> {
+    if (needsFullFormats && POT_URL) {
         try {
             return await openWebSession(videoId);
         } catch (err) {
