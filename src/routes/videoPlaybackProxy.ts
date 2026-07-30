@@ -48,7 +48,13 @@ videoPlaybackProxy.get("/", async (c) => {
         queryParams.set("ip", parsedDecryptedQueryParams.get("ip") as string);
     }
 
-    if (host == undefined || !/[\w-]+.googlevideo.com/.test(host)) {
+    // Live and Post-Live-DVR (`source=yt_live_broadcast`) segments are served
+    // from `*.c.youtube.com` hosts rather than the usual `*.googlevideo.com`;
+    // accept both so those streams aren't rejected here (see iv-org/invidious#4589).
+    if (
+        host == undefined ||
+        !/^[\w-]+\.(googlevideo\.com|c\.youtube\.com)$/.test(host)
+    ) {
         throw new HTTPException(400, {
             res: new Response("Host query string do not match or undefined."),
         });
@@ -150,13 +156,33 @@ videoPlaybackProxy.get("/", async (c) => {
     }
 
     const headersForResponse: Record<string, string> = {
-        "content-length": headResponse.headers.get("content-length") || "",
         "access-control-allow-origin": "*",
         "accept-ranges": headResponse.headers.get("accept-ranges") || "",
         "content-type": headResponse.headers.get("content-type") || "",
         "expires": headResponse.headers.get("expires") || "",
         "last-modified": headResponse.headers.get("last-modified") || "",
     };
+    // Live / Post-Live-DVR segments carry `noclen=1` and have no length; an
+    // empty content-length header would be invalid, so only send a real one.
+    const contentLength = headResponse.headers.get("content-length");
+    if (contentLength) headersForResponse["content-length"] = contentLength;
+
+    // Live / Post-Live-DVR manifest generation reads YouTube's `X-Head-*`
+    // metadata headers (X-Head-Time-Millis, X-Head-Seqnum, …) off the sq=0
+    // response to compute the stream duration and segment count. Forward them
+    // (and expose them to browsers) or YouTube.js throws "Failed to extract the
+    // duration or segment count for this Post Live DVR video".
+    const exposedHeaders: string[] = [];
+    for (const [name, value] of headResponse.headers) {
+        if (name.toLowerCase().startsWith("x-head-")) {
+            headersForResponse[name] = value;
+            exposedHeaders.push(name);
+        }
+    }
+    if (exposedHeaders.length > 0) {
+        headersForResponse["access-control-expose-headers"] =
+            exposedHeaders.join(", ");
+    }
 
     if (title) {
         headersForResponse["content-disposition"] = `attachment; filename="${
@@ -178,7 +204,7 @@ videoPlaybackProxy.get("/", async (c) => {
         } else {
             // i.e. "bytes=0-", "bytes=600-"
             // full size of content is able to be calculated, so a full Content-Range header can be constructed
-            const bytesReceived = headersForResponse["content-length"];
+            const bytesReceived = contentLength ?? "";
             // last byte should always be one less than the length
             const totalContentLength = Number(firstByte) +
                 Number(bytesReceived);
