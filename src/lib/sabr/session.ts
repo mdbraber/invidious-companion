@@ -1,34 +1,45 @@
 /**
- * SABR session + track pulling, ported from owntube/spikes/sabr-dash/sabr.ts.
+ * SABR session + track pulling.
  *
- * The player response is fetched with a **clean per-client innertube call**, not
- * through the companion's shared youtubei.js session. This is load-bearing: a
- * player response fetched under a blended session identity gets its streaming
- * session classified as suspect by the GVS — it serves ~60 seconds of media,
- * then stops and demands attestation. One coherent client identity (context,
- * user-agent header, and the ClientInfo echoed in every SABR request all
- * agreeing) streams hour-long videos to completion. No po_token is involved;
- * ANDROID_VR is exempt.
+ * Two ways to obtain a streaming session, in preference order:
  *
- * Only the companion session's visitorData is borrowed — without one the player
- * call answers LOGIN_REQUIRED.
+ *  1. **WEB with a proof-of-origin token.** Gives the full format list —
+ *     every video height and every dubbed audio track. Requires a po_token
+ *     provider (`SABR_POT_URL`), and the token attached to the *streaming*
+ *     request must be bound to the **video id**, not to visitorData. A
+ *     visitorData-bound token is accepted at first and then rejected ~60s in
+ *     with `streamProtectionStatus: 3` (= token seen and judged invalid), which
+ *     is indistinguishable from having no token at all until you look at the
+ *     status code.
+ *
+ *  2. **ANDROID_VR, no token.** Exempt from attestation, so it needs no
+ *     provider, but its player response lists only the original audio track.
+ *     Used automatically when no provider is configured or minting fails.
+ *
+ * In both cases the player response is fetched with **one coherent client
+ * identity** — context, user-agent, and the ClientInfo echoed in every SABR
+ * request all agreeing. A response fetched under a blended identity gets its
+ * streaming session classified as suspect and cut off after ~60s of media.
  */
-import { Buffer } from "node:buffer";
+import { Innertube } from "youtubei.js";
 import { SabrStream } from "gv/sabr-stream.js";
 import { buildSabrFormat, EnabledTrackTypes } from "gv/utils.js";
 
-export interface SabrCaptionTrack {
-    languageCode: string;
-    name: string;
-    kind?: string;
-    baseUrl: string;
-}
+const POT_URL = Deno.env.get("SABR_POT_URL") || "";
 
 export interface SabrAudioTrack {
     trackId: string;
     language?: string;
     isDubbed?: boolean;
     label: string;
+}
+
+export interface SabrVideoRendition {
+    height: number;
+    width?: number;
+    itag: number;
+    bitrate: number;
+    mimeType: string;
 }
 
 export interface SabrSession {
@@ -40,20 +51,15 @@ export interface SabrSession {
     url: string;
     ustreamer: string;
     clientInfo: Record<string, unknown>;
-    userAgent: string;
-    captions: SabrCaptionTrack[];
+    userAgent?: string;
+    poToken?: string;
     audioTracks: SabrAudioTrack[];
+    videoRenditions: SabrVideoRendition[];
+    /** Which path produced this session, for logging and manifest hints. */
+    mode: "web+pot" | "android_vr";
 }
 
-/**
- * The one client this connector speaks as. Everything — the player call's
- * context, its user-agent header, and the ClientInfo inside every SABR
- * request — comes from this single definition.
- *
- * Known trade-off: the raw ANDROID_VR response lists only the original audio
- * track, so dubbed languages are unavailable on this path.
- */
-const CLIENT = {
+const VR = {
     id: 28,
     version: "1.65.10",
     userAgent:
@@ -80,23 +86,124 @@ const CLIENT = {
     },
 };
 
-export async function openSabrSession(
-    videoId: string,
-    visitorData: string,
-): Promise<SabrSession> {
+async function mintPoToken(binding: string): Promise<string> {
+    const res = await fetch(POT_URL, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ content_binding: binding }),
+    });
+    const body = await res.json() as { poToken?: string };
+    if (!body.poToken) {
+        throw new Error(`po_token provider returned no token for ${binding}`);
+    }
+    return body.poToken;
+}
+
+// deno-lint-ignore no-explicit-any
+const isMp4 = (f: any) => (f.mimeType ?? "").includes("mp4");
+
+// deno-lint-ignore no-explicit-any
+function describeTracks(formats: any[]) {
+    const audio = new Map<string, SabrAudioTrack>();
+    // deno-lint-ignore no-explicit-any
+    for (const f of formats.filter((x: any) => !x.width && isMp4(x))) {
+        const trackId = f.audioTrackId ?? f.language ?? "default";
+        if (audio.has(trackId)) continue;
+        const lang = f.language ?? String(trackId).split(".")[0];
+        audio.set(trackId, {
+            trackId,
+            language: lang,
+            isDubbed: f.isDubbed,
+            label: f.isDubbed ? `${lang} (dubbed)` : lang,
+        });
+    }
+
+    const video = new Map<number, SabrVideoRendition>();
+    // deno-lint-ignore no-explicit-any
+    for (const f of formats.filter((x: any) => x.width && isMp4(x))) {
+        // Keep the highest-bitrate format per height (there can be several).
+        const existing = video.get(f.height);
+        if (existing && existing.bitrate >= Number(f.bitrate ?? 0)) continue;
+        video.set(f.height, {
+            height: f.height,
+            width: f.width,
+            itag: f.itag,
+            bitrate: Number(f.bitrate ?? 0),
+            mimeType: f.mimeType ?? "",
+        });
+    }
+
+    return {
+        audioTracks: [...audio.values()],
+        videoRenditions: [...video.values()].sort((a, b) => a.height - b.height),
+    };
+}
+
+/** WEB + po_token: the full ladder and every dubbed track. */
+async function openWebSession(videoId: string): Promise<SabrSession> {
+    // The GVS token must be bound to the video id — see the note at the top.
+    const poToken = await mintPoToken(videoId);
+
+    const bootstrap = await Innertube.create({ retrieve_player: false });
+    const visitorData = bootstrap.session.context.client.visitorData;
+    if (!visitorData) throw new Error("no visitorData");
+
+    const innertube = await Innertube.create({
+        po_token: poToken,
+        visitor_data: visitorData,
+    });
+    // deno-lint-ignore no-explicit-any
+    const info: any = await innertube.getBasicInfo(videoId, "WEB" as any);
+
+    const url = await innertube.session.player?.decipher(
+        info.streaming_data?.server_abr_streaming_url,
+    );
+    const ustreamer = info.player_config?.media_common_config
+        ?.media_ustreamer_request_config?.video_playback_ustreamer_config;
+    if (!url || !ustreamer) {
+        throw new Error(`${videoId}: no SABR streaming url / ustreamer config`);
+    }
+
+    const formats = (info.streaming_data?.adaptive_formats ?? []).map(
+        buildSabrFormat,
+    );
+
+    return {
+        videoId,
+        title: info.basic_info?.title ?? videoId,
+        durationSec: info.basic_info?.duration ?? 0,
+        formats,
+        url,
+        ustreamer,
+        poToken,
+        clientInfo: {
+            clientName: 1,
+            clientVersion: innertube.session.context.client.clientVersion,
+        },
+        mode: "web+pot",
+        ...describeTracks(formats),
+    };
+}
+
+/** ANDROID_VR: no token needed, original audio track only. */
+async function openVrSession(videoId: string): Promise<SabrSession> {
+    const bootstrap = await Innertube.create({ retrieve_player: false });
+    const visitorData = bootstrap.session.context.client.visitorData;
+    if (!visitorData) throw new Error("no visitorData");
+
     const res = await fetch(
         "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
         {
             method: "POST",
             headers: {
                 "content-type": "application/json",
-                "user-agent": CLIENT.userAgent,
-                "x-youtube-client-name": String(CLIENT.id),
-                "x-youtube-client-version": CLIENT.version,
+                "user-agent": VR.userAgent,
+                "x-youtube-client-name": String(VR.id),
+                "x-youtube-client-version": VR.version,
                 "x-goog-visitor-id": visitorData,
             },
             body: JSON.stringify({
-                context: { client: { ...CLIENT.context, visitorData } },
+                context: { client: { ...VR.context, visitorData } },
                 videoId,
                 contentCheckOk: true,
                 racyCheckOk: true,
@@ -140,20 +247,6 @@ export async function openSabrSession(
         } as any)
     );
 
-    const seen = new Map<string, SabrAudioTrack>();
-    // deno-lint-ignore no-explicit-any
-    for (const f of formats.filter((x: any) => !x.width)) {
-        const trackId = f.audioTrackId ?? f.language ?? "default";
-        if (seen.has(trackId)) continue;
-        const lang = f.language ?? trackId.split(".")[0];
-        seen.set(trackId, {
-            trackId,
-            language: lang,
-            isDubbed: f.isDubbed,
-            label: f.isDubbed ? `${lang} (dubbed)` : lang,
-        });
-    }
-
     return {
         videoId,
         title: player?.videoDetails?.title ?? videoId,
@@ -161,24 +254,30 @@ export async function openSabrSession(
         formats,
         url,
         ustreamer,
-        clientInfo: CLIENT.clientInfo,
-        userAgent: CLIENT.userAgent,
-        captions: (player?.captions?.playerCaptionsTracklistRenderer
-            ?.captionTracks ?? [])
-            // deno-lint-ignore no-explicit-any
-            .map((c: any) => ({
-                languageCode: c.languageCode,
-                name: c.name?.simpleText ?? c.name?.runs?.[0]?.text ??
-                    c.languageCode,
-                kind: c.kind,
-                baseUrl: c.baseUrl,
-            })),
-        audioTracks: [...seen.values()],
+        clientInfo: VR.clientInfo,
+        userAgent: VR.userAgent,
+        mode: "android_vr",
+        ...describeTracks(formats),
     };
 }
 
+export async function openSabrSession(videoId: string): Promise<SabrSession> {
+    if (POT_URL) {
+        try {
+            return await openWebSession(videoId);
+        } catch (err) {
+            console.log(
+                `[WARN] [sabr] [${videoId}] WEB+pot session failed (${
+                    (err as Error).message
+                }); falling back to ANDROID_VR, dubbed audio will be unavailable`,
+            );
+        }
+    }
+    return await openVrSession(videoId);
+}
+
 export interface SabrPullSelection {
-    /** Video height to pull, or null for audio-only. */
+    /** Exact video height to pull, or null for audio-only. */
     height?: number | null;
     audioTrackId?: string;
 }
@@ -196,26 +295,30 @@ export function pullSabrTrack(
         formats: session.formats,
         serverAbrStreamingUrl: session.url,
         videoPlaybackUstreamerConfig: session.ustreamer,
+        ...(session.poToken ? { poToken: session.poToken } : {}),
         // deno-lint-ignore no-explicit-any
         clientInfo: session.clientInfo as any,
-        // Present the client we claim to be on the videoplayback POSTs too.
-        // deno-lint-ignore no-explicit-any
-        fetch: (input: any, init?: any) =>
-            fetch(input, {
-                ...init,
-                headers: {
-                    ...(init?.headers ?? {}),
-                    "user-agent": session.userAgent,
-                },
-            }),
+        ...(session.userAgent
+            ? {
+                // deno-lint-ignore no-explicit-any
+                fetch: (input: any, init?: any) =>
+                    fetch(input, {
+                        ...init,
+                        headers: {
+                            ...(init?.headers ?? {}),
+                            "user-agent": session.userAgent,
+                        },
+                    }),
+            }
+            : {}),
     });
 
-    // deno-lint-ignore no-explicit-any
-    const isMp4 = (f: any) => (f.mimeType ?? "").includes("mp4");
     // deno-lint-ignore no-explicit-any
     const audioFor = (fs: any[]) => {
         const audio = fs.filter((f) => isMp4(f) && !f.width);
         if (!sel.audioTrackId) {
+            // The default track, explicitly: taking the first entry picks
+            // whichever dub the server happens to list first.
             return audio.find((f) => !f.isDubbed && !f.isDrc) ??
                 audio.find((f) => !f.isDubbed) ?? audio[0];
         }
@@ -247,5 +350,3 @@ export function pullSabrTrack(
             : res.selectedFormats.audioFormat,
     }));
 }
-
-export { Buffer };

@@ -1,5 +1,5 @@
 /**
- * Cuts a fragmented-MP4 byte stream into DASH-servable pieces, in memory.
+ * Cuts a fragmented-MP4 byte stream into DASH-servable pieces, progressively.
  *
  * SABR delivers fMP4: a header (`ftyp` + `moov`, which carries `mvex` and so is
  * an init segment by construction) followed by repeating `moof` + `mdat` pairs.
@@ -7,8 +7,9 @@
  * `initialization`, each `moof`+`mdat` pair becomes one numbered media segment.
  * No re-muxing, no transcode — box walking only.
  *
- * Ported from owntube/spikes/sabr-dash/segmenter.ts; writes to a Map instead of
- * disk because the companion's `--allow-write` list is deliberately short.
+ * `TrackBuffer` exposes segments *as they arrive* rather than after the pull
+ * finishes, so a player can start on segment 1 while the rest is still being
+ * fetched. Waiters are resolved per segment number.
  */
 import { Buffer } from "node:buffer";
 
@@ -16,14 +17,6 @@ export interface SegmentInfo {
     number: number;
     bytes: number;
     baseMediaDecodeTime?: number;
-}
-
-export interface SegmentResult {
-    initBytes: number;
-    segments: SegmentInfo[];
-    timescale?: number;
-    /** "init.mp4" and "seg-N.m4s" -> bytes. */
-    files: Map<string, Uint8Array>;
 }
 
 function readBox(
@@ -61,63 +54,138 @@ function findBaseMediaDecodeTime(moof: Buffer): number | undefined {
     return off + 4 <= moof.length ? moof.readUInt32BE(off) : undefined;
 }
 
-export async function segmentToMemory(
-    stream: ReadableStream<Uint8Array>,
-): Promise<SegmentResult> {
-    let buf = Buffer.alloc(0);
-    let init: Buffer | null = null;
-    let pendingMoof: Buffer | null = null;
-    const segments: SegmentInfo[] = [];
-    const headerBoxes: Buffer[] = [];
-    const files = new Map<string, Uint8Array>();
+/**
+ * One track's segments, filled in the background and readable while filling.
+ */
+export class TrackBuffer {
+    readonly files = new Map<string, Uint8Array>();
+    readonly segments: SegmentInfo[] = [];
+    timescale?: number;
+    /** Resolves when the whole track has been pulled; rejects if the pull did. */
+    readonly done: Promise<void>;
+    complete = false;
+    error?: Error;
+    bytes = 0;
 
-    const flushBoxes = () => {
-        let off = 0;
-        for (;;) {
-            const box = readBox(buf, off);
-            if (!box) break;
-            const raw = buf.subarray(off, off + box.size);
+    private waiters = new Map<string, Array<() => void>>();
+    private resolveDone!: () => void;
+    private rejectDone!: (e: Error) => void;
 
-            if (!init) {
-                // Everything before the first moof is the init segment.
-                if (box.type === "moof") {
-                    init = Buffer.concat(headerBoxes);
-                    files.set("init.mp4", new Uint8Array(init));
-                    pendingMoof = Buffer.from(raw);
-                } else {
-                    headerBoxes.push(Buffer.from(raw));
-                }
-            } else if (box.type === "moof") {
-                pendingMoof = Buffer.from(raw);
-            } else if (box.type === "mdat" && pendingMoof) {
-                const number = segments.length + 1;
-                const segment = Buffer.concat([pendingMoof, raw]);
-                files.set(`seg-${number}.m4s`, new Uint8Array(segment));
-                segments.push({
-                    number,
-                    bytes: segment.length,
-                    baseMediaDecodeTime: findBaseMediaDecodeTime(pendingMoof),
-                });
-                pendingMoof = null;
-            }
-            off += box.size;
-        }
-        if (off > 0) buf = buf.subarray(off);
-    };
-
-    const reader = stream.getReader();
-    for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf = Buffer.concat([buf, Buffer.from(value)]);
-        flushBoxes();
+    constructor() {
+        this.done = new Promise<void>((res, rej) => {
+            this.resolveDone = res;
+            this.rejectDone = rej;
+        });
+        // The pull is consumed by fill(); nothing else awaits `done` unless it
+        // wants completion, so make sure a failure is never an unhandled
+        // rejection.
+        this.done.catch(() => {});
     }
-    flushBoxes();
 
-    return {
-        initBytes: init === null ? 0 : (init as Buffer).length,
-        segments,
-        timescale: init ? findTimescale(init) : undefined,
-        files,
-    };
+    private publish(name: string, bytes: Uint8Array) {
+        this.files.set(name, bytes);
+        this.bytes += bytes.length;
+        const w = this.waiters.get(name);
+        if (w) {
+            this.waiters.delete(name);
+            for (const fn of w) fn();
+        }
+    }
+
+    private releaseAll() {
+        for (const [, w] of this.waiters) for (const fn of w) fn();
+        this.waiters.clear();
+    }
+
+    /**
+     * Resolve once `name` exists, the track finishes, or `timeoutMs` elapses.
+     * Returns the bytes, or undefined if it never appeared.
+     */
+    async get(
+        name: string,
+        timeoutMs = 30_000,
+    ): Promise<Uint8Array | undefined> {
+        const have = this.files.get(name);
+        if (have) return have;
+        if (this.complete || this.error) return undefined;
+
+        await new Promise<void>((resolve) => {
+            let settled = false;
+            const finish = () => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                resolve();
+            };
+            const timer = setTimeout(finish, timeoutMs);
+            const list = this.waiters.get(name) ?? [];
+            list.push(finish);
+            this.waiters.set(name, list);
+        });
+        return this.files.get(name);
+    }
+
+    /** Consume a pulled fMP4 stream, publishing segments as they complete. */
+    async fill(stream: ReadableStream<Uint8Array>): Promise<void> {
+        let buf = Buffer.alloc(0);
+        let init: Buffer | null = null;
+        let pendingMoof: Buffer | null = null;
+        const headerBoxes: Buffer[] = [];
+
+        const flush = () => {
+            let off = 0;
+            for (;;) {
+                const box = readBox(buf, off);
+                if (!box) break;
+                const raw = buf.subarray(off, off + box.size);
+
+                if (!init) {
+                    // Everything before the first moof is the init segment.
+                    if (box.type === "moof") {
+                        init = Buffer.concat(headerBoxes);
+                        this.timescale = findTimescale(init);
+                        this.publish("init.mp4", new Uint8Array(init));
+                        pendingMoof = Buffer.from(raw);
+                    } else {
+                        headerBoxes.push(Buffer.from(raw));
+                    }
+                } else if (box.type === "moof") {
+                    pendingMoof = Buffer.from(raw);
+                } else if (box.type === "mdat" && pendingMoof) {
+                    const number = this.segments.length + 1;
+                    const seg = Buffer.concat([pendingMoof, raw]);
+                    this.segments.push({
+                        number,
+                        bytes: seg.length,
+                        baseMediaDecodeTime: findBaseMediaDecodeTime(
+                            pendingMoof,
+                        ),
+                    });
+                    this.publish(`seg-${number}.m4s`, new Uint8Array(seg));
+                    pendingMoof = null;
+                }
+                off += box.size;
+            }
+            if (off > 0) buf = buf.subarray(off);
+        };
+
+        try {
+            const reader = stream.getReader();
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buf = Buffer.concat([buf, Buffer.from(value)]);
+                flush();
+            }
+            flush();
+            this.complete = true;
+            this.releaseAll();
+            this.resolveDone();
+        } catch (err) {
+            this.error = err as Error;
+            this.releaseAll();
+            this.rejectDone(this.error);
+            throw this.error;
+        }
+    }
 }
