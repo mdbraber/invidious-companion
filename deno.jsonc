@@ -56,7 +56,9 @@
     // Stubs for Node-specific dependencies not used in Deno.
     "canvas": "./src/lib/extra/emptyExport.ts",
     "bufferutil": "./src/lib/extra/emptyExport.ts",
-    "utf-8-validate": "./src/lib/extra/emptyExport.ts"
+    "utf-8-validate": "./src/lib/extra/emptyExport.ts",
+    "gv/": "./vendor/googlevideo/src/exports/",
+    "@bufbuild/protobuf/wire": "npm:@bufbuild/protobuf@^2.0.0/wire"
   },
   // Unstable Deno APIs used by the application.
   "unstable": [

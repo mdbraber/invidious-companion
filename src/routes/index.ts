@@ -8,6 +8,7 @@ import invidiousRouteDashManifest from "./invidious_routes/dashManifest.ts";
 import invidiousCaptionsApi from "./invidious_routes/captions.ts";
 import getDownloadHandler from "./invidious_routes/download.ts";
 import videoPlaybackProxy from "./videoPlaybackProxy.ts";
+import sabrRoutes from "./sabrRoutes.ts";
 import type { Config } from "../lib/helpers/config.ts";
 import metrics from "./metrics.ts";
 import health from "./health.ts";
@@ -41,6 +42,7 @@ export const companionRoutes = (
     app.route("/api/manifest/dash/id", invidiousRouteDashManifest);
     app.route("/api/v1/captions", invidiousCaptionsApi);
     app.route("/videoplayback", videoPlaybackProxy);
+    app.route("/sabr", sabrRoutes);
 };
 
 export const miscRoutes = (
