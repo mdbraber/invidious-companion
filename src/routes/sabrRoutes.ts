@@ -17,16 +17,22 @@
  * worth having: abandoning playback stops the download, instead of quietly
  * fetching the rest of the video.
  *
- * Live and post-live DVR are **delegated** to the companion's existing
- * `/api/manifest/dash/id` route. Note this is a pragmatic choice, not a
- * protocol limit: SABR does carry live, and yt-dlp implements it (~180
- * references to broadcast handling — head tracking, end detection, deep
- * rewind, seekable-range and target-duration logic). What we lack is that
- * subsystem in `SabrStream`, the headless downloader here, which has none of
- * it and simply stalls. Meanwhile YouTube publishes a native dynamic DASH
- * manifest for live, and the companion route already serves it including the
- * fresh-token handling post-live DVR needs — so reimplementing it would be a
- * lot of work to arrive back where we already are.
+ * **Live is not supported.** Live and post-live requests are redirected to the
+ * companion's `/api/manifest/dash/id`, which is the right layering — but be
+ * aware that route currently answers live with an *empty* manifest (417 bytes,
+ * `<Period/>`, zero representations; verified against a confirmed-live
+ * stream). So the redirect is correct plumbing in front of a gap, not a
+ * working live path.
+ *
+ * Two things would be needed, and neither is small. SABR itself does carry
+ * live — yt-dlp implements it with ~180 references to broadcast handling (head
+ * tracking, end detection, deep rewind, seekable ranges) — but `SabrStream`,
+ * the headless downloader here, has none of that and stalls on a live pull.
+ * Alternatively YouTube's native dynamic manifest could be proxied: it is
+ * real and complete (1MB, `type="dynamic"`, 9 BaseURLs), but its segment URLs
+ * are absolute googlevideo addresses with *path-encoded* parameters, whereas
+ * the companion's videoplayback proxy takes query parameters — so every
+ * BaseURL would have to be rewritten.
  *
  * Delegation triggers on either signal: the player response says live, or the
  * track has no `sidx`. The second matters because a post-live recording that
@@ -237,7 +243,9 @@ async function prepare(
     const log = (m: string) => console.log(`[INFO] [sabr] [${videoId}] ${m}`);
 
     if (session.isLive) {
-        log("live/post-live — delegating to /api/manifest/dash/id");
+        log(
+            "live/post-live — redirecting to /api/manifest/dash/id (note: that route returns an empty manifest for live)",
+        );
         return {
             session,
             at: Date.now(),
@@ -427,10 +435,19 @@ sabrRoutes.get("/:videoId/manifest.mpd", async (c) => {
  * — a podcast app fetching an RSS enclosure, for instance.
  *
  * Delegates to the companion's existing `/latest_version`, which serves a
- * muxed progressive file through the videoplayback proxy and already supports
- * Range requests and resumption. Muxing the separate SABR video and audio
- * tracks here would need a real muxer, for no benefit while muxed itag 18
- * exists. `itag=140` gives audio only, which is what a podcast feed wants.
+ * progressive file through the videoplayback proxy with Range support and
+ * resumption.
+ *
+ * `itag=140` (audio only) is the podcast case and works reliably. `itag=18`
+ * (muxed 360p video+audio) is **intermittent**: it returns 403 from googlevideo
+ * in bursts, and does so through the untouched `/latest_version` route as well,
+ * so it is a pre-existing companion behaviour rather than anything this
+ * connector introduces. Resolving the format here from an uncached player
+ * response was tried and made no difference, which rules out the stale-token
+ * explanation that fits the DVR fix.
+ *
+ * Muxing the separate SABR video and audio tracks here would need a real
+ * muxer, which is why this delegates rather than assembling anything.
  */
 sabrRoutes.get("/:videoId/download", (c) => {
     const videoId = guard(c);
