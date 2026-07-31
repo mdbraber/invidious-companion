@@ -8,6 +8,7 @@
  *   GET /sabr/:videoId/manifest.mpd[?audio=de,fr][?check=]
  *   GET /sabr/:videoId/:track/:file[?check=]
  *   GET /sabr/:videoId/download[?itag=][?check=]
+ *   GET /sabr/:videoId/watch                         dash.js page, for a browser
  *
  * **Nothing is cached.** Manifests are built from the `sidx` index carried in
  * each track's init segment, and segments come from short-lived readers
@@ -17,26 +18,15 @@
  * worth having: abandoning playback stops the download, instead of quietly
  * fetching the rest of the video.
  *
- * **Live is not supported.** Live and post-live requests are redirected to the
- * companion's `/api/manifest/dash/id`, which is the right layering — but be
- * aware that route currently answers live with an *empty* manifest (417 bytes,
- * `<Period/>`, zero representations; verified against a confirmed-live
- * stream). So the redirect is correct plumbing in front of a gap, not a
- * working live path.
+ * **Live and post-live DVR work**, but not through SABR. A broadcast is
+ * manifest-driven per-segment fetching, not an adaptive-bitrate stream — kira
+ * and FreeTube both play live through `SabrStreamingAdapter`, which skips the
+ * ABR request loop entirely for it. So live proxies YouTube's own dynamic
+ * manifest with its BaseURLs rewritten to point back here; see lib/sabr/live.ts.
  *
- * Two things would be needed, and neither is small. SABR itself does carry
- * live — yt-dlp implements it with ~180 references to broadcast handling (head
- * tracking, end detection, deep rewind, seekable ranges) — but `SabrStream`,
- * the headless downloader here, has none of that and stalls on a live pull.
- * Alternatively YouTube's native dynamic manifest could be proxied: it is
- * real and complete (1MB, `type="dynamic"`, 9 BaseURLs), but its segment URLs
- * are absolute googlevideo addresses with *path-encoded* parameters, whereas
- * the companion's videoplayback proxy takes query parameters — so every
- * BaseURL would have to be rewritten.
- *
- * Delegation triggers on either signal: the player response says live, or the
- * track has no `sidx`. The second matters because a post-live recording that
- * *does* carry an index is served here as ordinary VOD, rather than being
+ * The live path triggers on either signal: the player response says live, or
+ * the track has no `sidx`. The second matters because a post-live recording
+ * that *does* carry an index is served here as ordinary VOD, rather than being
  * excluded by its label.
  *
  * When `server.verify_requests` is on, every route requires the same
@@ -431,6 +421,7 @@ sabrRoutes.get("/:videoId/watch", (c) => {
     return c.body(`<!doctype html>
 <html><head><meta charset="utf-8"><title>SABR&rarr;DASH ${videoId}</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="data:,">
 <script src="https://cdn.dashjs.org/latest/dash.all.min.js"></script>
 <style>
   body{font:14px/1.5 system-ui,sans-serif;margin:0;padding:1rem;background:#111;color:#eee}
@@ -452,7 +443,15 @@ sabrRoutes.get("/:videoId/watch", (c) => {
 <div class="row" id="stat"></div>
 <div id="log"></div>
 <script>
-  var log = function (m) { document.getElementById('log').textContent += m + '\n'; };
+  // One element per line, rather than appending a newline escape. This script
+  // is emitted through a template literal, where "\\n" is one escaping layer
+  // too many and collapses into a real newline — which lands mid-string and
+  // leaves the whole script unterminated.
+  var log = function (m) {
+    var d = document.createElement('div');
+    d.textContent = m;
+    document.getElementById('log').appendChild(d);
+  };
   var player = dashjs.MediaPlayer().create();
   player.initialize(document.getElementById('v'), ${JSON.stringify(manifest)}, true);
   player.updateSettings({ streaming: { buffer: { fastSwitchEnabled: true } } });
