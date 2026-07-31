@@ -840,6 +840,10 @@ export class SabrStream extends EventEmitterLike {
                 this.formatToDiscard = formatIdKey;
             }
         }
+        // A broadcast re-sends this on every response. Re-initializing would drop
+        // the downloaded segments and consumed ranges each time, so the stream
+        // could never make progress — refresh the metadata and keep the state.
+        // yt-dlp ignores a repeat initialization outright for the same reason.
         const initializedFormat = {
             formatInitializationMetadata: formatInitMetadata,
             downloadedSegments: new Map(),
