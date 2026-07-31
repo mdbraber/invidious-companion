@@ -407,6 +407,99 @@ const checkSuffixes = (c: Ctx) => {
         : { q: "", amp: "" };
 };
 
+/**
+ * A minimal player page, so the connector can be opened in a browser rather
+ * than only exercised by tooling. dash.js is loaded from a CDN — this is a
+ * spike aid, not something to ship.
+ *
+ * Shows what the manifest actually offers (quality rungs, audio tracks,
+ * subtitles) and lets each be switched, because those are the parts that
+ * command-line checks cannot really prove.
+ */
+sabrRoutes.get("/:videoId/watch", (c) => {
+    const videoId = guard(c);
+    const { q } = checkSuffixes(c);
+    const audio = c.req.query("audio");
+    // Sibling of this route: /sabr/<id>/watch -> /sabr/<id>/manifest.mpd
+    const manifest = `manifest.mpd${
+        audio
+            ? (q ? `${q}&audio=${encodeURIComponent(audio)}` : `?audio=${encodeURIComponent(audio)}`)
+            : q
+    }`;
+
+    c.header("content-type", "text/html; charset=utf-8");
+    return c.body(`<!doctype html>
+<html><head><meta charset="utf-8"><title>SABR&rarr;DASH ${videoId}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<script src="https://cdn.dashjs.org/latest/dash.all.min.js"></script>
+<style>
+  body{font:14px/1.5 system-ui,sans-serif;margin:0;padding:1rem;background:#111;color:#eee}
+  video{width:100%;max-width:1280px;background:#000;aspect-ratio:16/9}
+  .row{margin:.75rem 0;display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}
+  select,button{font:inherit;padding:.3rem .5rem;background:#222;color:#eee;border:1px solid #444;border-radius:4px}
+  code{background:#222;padding:.1rem .35rem;border-radius:3px}
+  #log{white-space:pre-wrap;font-family:ui-monospace,monospace;font-size:12px;color:#9b9;max-height:9rem;overflow:auto}
+</style></head>
+<body>
+<h2 style="margin:0 0 .5rem">SABR&rarr;DASH &mdash; <code>${videoId}</code></h2>
+<video id="v" controls autoplay muted playsinline></video>
+<div class="row">
+  <label>quality <select id="q"><option value="-1">auto</option></select></label>
+  <label>audio <select id="a"></select></label>
+  <label>subtitles <select id="t"><option value="-1">off</option></select></label>
+  <button id="live">jump to live edge</button>
+</div>
+<div class="row" id="stat"></div>
+<div id="log"></div>
+<script>
+  var log = function (m) { document.getElementById('log').textContent += m + '\n'; };
+  var player = dashjs.MediaPlayer().create();
+  player.initialize(document.getElementById('v'), ${JSON.stringify(manifest)}, true);
+  player.updateSettings({ streaming: { buffer: { fastSwitchEnabled: true } } });
+
+  function fill(sel, items, label) {
+    items.forEach(function (it, i) {
+      var o = document.createElement('option'); o.value = i; o.textContent = label(it, i); sel.appendChild(o);
+    });
+  }
+  player.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, function () {
+    var vq = player.getRepresentationsByType('video') || [];
+    fill(document.getElementById('q'), vq, function (r) { return (r.height || '?') + 'p'; });
+    var at = player.getTracksFor('audio') || [];
+    fill(document.getElementById('a'), at, function (t, i) { return t.lang || ('track ' + i); });
+    var tt = player.getTracksFor('text') || [];
+    fill(document.getElementById('t'), tt, function (t, i) { return t.lang || ('sub ' + i); });
+    var d = player.duration();
+    document.getElementById('stat').textContent =
+      'duration ' + (isFinite(d) ? d.toFixed(0) + 's' : 'live') +
+      ' | ' + vq.length + ' quality rungs, ' + at.length + ' audio, ' + tt.length + ' subtitle';
+    log('manifest loaded');
+  });
+  document.getElementById('q').onchange = function (e) {
+    var i = Number(e.target.value);
+    player.updateSettings({ streaming: { abr: { autoSwitchBitrate: { video: i < 0 } } } });
+    if (i >= 0) player.setRepresentationForTypeByIndex('video', i, true);
+    log('quality -> ' + (i < 0 ? 'auto' : e.target.selectedOptions[0].textContent));
+  };
+  document.getElementById('a').onchange = function (e) {
+    var t = (player.getTracksFor('audio') || [])[Number(e.target.value)];
+    if (t) { player.setCurrentTrack(t); log('audio -> ' + (t.lang || '?')); }
+  };
+  document.getElementById('t').onchange = function (e) {
+    var i = Number(e.target.value);
+    player.enableText(i >= 0);
+    if (i >= 0) player.setTextTrack(i);
+    log('subtitles -> ' + (i < 0 ? 'off' : e.target.selectedOptions[0].textContent));
+  };
+  document.getElementById('live').onclick = function () {
+    try { player.seek(player.duration()); } catch (err) { log('seek failed: ' + err); }
+  };
+  player.on(dashjs.MediaPlayer.events.ERROR, function (e) { log('ERROR ' + JSON.stringify(e.error || e)); });
+  player.on(dashjs.MediaPlayer.events.PLAYBACK_ERROR, function (e) { log('PLAYBACK_ERROR ' + JSON.stringify(e)); });
+</script>
+</body></html>`);
+});
+
 sabrRoutes.get("/:videoId/manifest.mpd", async (c) => {
     const videoId = guard(c);
     const audio = (c.req.query("audio") ?? "").split(",").map((s) => s.trim())
