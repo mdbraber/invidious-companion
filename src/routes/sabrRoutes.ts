@@ -58,6 +58,7 @@ import {
     ReaderPool,
     type TrackIndex,
 } from "../lib/sabr/reader.ts";
+import { getLiveManifest, liveBaseUrl } from "../lib/sabr/live.ts";
 
 /** Height indexed up front; other renditions are indexed on first request. */
 const SEED_HEIGHT = Number(Deno.env.get("SABR_SEED_HEIGHT") || 360);
@@ -414,10 +415,26 @@ sabrRoutes.get("/:videoId/manifest.mpd", async (c) => {
     const resolved = await getPrepared(videoId, audio);
     const { q, amp } = checkSuffixes(c);
 
-    // Live / post-live DVR, or anything without an index: hand off to the
-    // route that already does this well.
+    // Live and post-live DVR: serve YouTube's own dynamic manifest with its
+    // BaseURLs pointed back here, so the IP-locked googlevideo addresses are
+    // fetched by us rather than by the client. See lib/sabr/live.ts for why
+    // this is not done through SABR.
     if (resolved.delegate) {
-        return c.redirect(`../../api/manifest/dash/id/${videoId}${q}`, 302);
+        const dashUrl = resolved.session.dashManifestUrl;
+        if (!dashUrl) {
+            // Nothing to proxy — fall back to the route that at least tries.
+            return c.redirect(`../../api/manifest/dash/id/${videoId}${q}`, 302);
+        }
+        const checkSegment = encodeURIComponent(c.req.query("check") ?? "-");
+        const { xml } = await getLiveManifest(
+            videoId,
+            dashUrl,
+            `live/${checkSegment}/`,
+        );
+        c.header("content-type", "application/dash+xml");
+        c.header("access-control-allow-origin", "*");
+        c.header("cache-control", "no-cache");
+        return c.body(xml);
     }
 
     const audioTracks = [...resolved.tracks.values()].filter((t) => !t.isVideo);
@@ -462,6 +479,75 @@ sabrRoutes.get("/:videoId/download", (c) => {
     const title = c.req.query("title");
     if (title) params.set("title", title);
     return c.redirect(`../../latest_version?${params.toString()}`, 302);
+});
+
+/**
+ * Live segment proxy. The manifest points every `BaseURL` here, and DASH
+ * resolves `<SegmentURL media="sq/123/lmt/31"/>` against it — so the tail of
+ * this path is the segment's own path beneath the real googlevideo BaseURL.
+ *
+ * The `check` sits in the path rather than the query because a relative
+ * SegmentURL would discard a query string.
+ */
+sabrRoutes.get("/:videoId/live/:check/:rep/*", async (c) => {
+    const videoId = c.req.param("videoId");
+    if (!validateVideoId(videoId)) {
+        throw new HTTPException(400, {
+            res: new Response("Invalid video ID format."),
+        });
+    }
+    const config = c.get("config");
+    const check = decodeURIComponent(c.req.param("check"));
+    if (config.server.verify_requests) {
+        if (check === "-" || verifyRequest(check, videoId, config) === false) {
+            throw new HTTPException(400, { res: new Response("ID incorrect.") });
+        }
+    }
+
+    const rep = Number(c.req.param("rep"));
+    if (!Number.isInteger(rep) || rep < 0) {
+        throw new HTTPException(400, {
+            res: new Response("Invalid representation."),
+        });
+    }
+
+    const base = await liveBaseUrl(videoId, rep);
+    if (!base) {
+        throw new HTTPException(404, {
+            res: new Response("Live manifest not held. Request the manifest first."),
+        });
+    }
+
+    // Everything after `/<rep>/` is the segment path the manifest asked for.
+    const marker = `/live/${c.req.param("check")}/${c.req.param("rep")}/`;
+    const idx = c.req.path.indexOf(marker);
+    const tail = idx < 0 ? "" : c.req.path.slice(idx + marker.length);
+    if (!/^[\w./-]*$/.test(tail)) {
+        throw new HTTPException(400, {
+            res: new Response("Invalid segment path."),
+        });
+    }
+
+    const upstream = await fetch(base + tail, {
+        headers: {
+            accept: "*/*",
+            origin: "https://www.youtube.com",
+            referer: "https://www.youtube.com",
+        },
+    });
+    if (!upstream.ok || !upstream.body) {
+        throw new HTTPException(502, {
+            res: new Response(`Upstream segment HTTP ${upstream.status}`),
+        });
+    }
+
+    c.header("access-control-allow-origin", "*");
+    c.header(
+        "content-type",
+        upstream.headers.get("content-type") ?? "application/octet-stream",
+    );
+    c.header("cache-control", "no-cache");
+    return c.body(upstream.body);
 });
 
 sabrRoutes.get("/:videoId/:track/:file", async (c) => {

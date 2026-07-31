@@ -73,6 +73,8 @@ export interface SabrSession {
      * DASH manifest route, which serves YouTube's native dynamic manifest.
      */
     isLive: boolean;
+    /** YouTube's own dynamic manifest, for the live path. */
+    dashManifestUrl?: string;
     /** Which path produced this session, for logging and manifest hints. */
     mode: "web+pot" | "android_vr";
 }
@@ -222,6 +224,7 @@ async function openWebSession(videoId: string): Promise<SabrSession> {
         isLive: Boolean(
             info.basic_info?.is_live || info.basic_info?.is_post_live_dvr,
         ),
+        dashManifestUrl: info.streaming_data?.dash_manifest_url,
         mode: "web+pot",
         ...describeTracks(formats),
     };
@@ -308,6 +311,7 @@ async function openVrSession(videoId: string): Promise<SabrSession> {
         ),
         clientInfo: VR.clientInfo,
         userAgent: VR.userAgent,
+        dashManifestUrl: player?.streamingData?.dashManifestUrl,
         isLive: Boolean(
             player?.videoDetails?.isLive ||
                 player?.videoDetails?.isPostLiveDvr ||
