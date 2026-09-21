@@ -610,11 +610,16 @@ sabrRoutes.get("/:videoId/live/:check/:rep/*", async (c) => {
         });
     }
 
-    // Everything after `/<rep>/` is the segment path the manifest asked for.
-    const marker = `/live/${c.req.param("check")}/${c.req.param("rep")}/`;
-    const idx = c.req.path.indexOf(marker);
-    const tail = idx < 0 ? "" : c.req.path.slice(idx + marker.length);
-    if (!/^[\w./-]*$/.test(tail)) {
+    // Everything after `/live/<check>/<rep>/` is the segment path the
+    // manifest asked for. Taken by position from the raw path: matching a
+    // marker built from the *decoded* `check` param misses whenever the
+    // signature is percent-encoded (its `=` padding), which left `tail` empty
+    // and fetched the bare BaseURL — googlevideo answers that with the newest
+    // segment, whatever `sq` was requested.
+    const afterLive = c.req.path.slice(c.req.path.indexOf("/live/") + 6);
+    const tail = afterLive.split("/").slice(2).join("/");
+    // An empty tail would fetch that same newest-segment answer.
+    if (!tail || !/^[\w./-]*$/.test(tail)) {
         throw new HTTPException(400, {
             res: new Response("Invalid segment path."),
         });
