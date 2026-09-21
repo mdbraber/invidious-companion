@@ -169,7 +169,9 @@ function describeTracks(formats: any[]) {
 
     return {
         audioTracks: [...audio.values()],
-        videoRenditions: [...video.values()].sort((a, b) => a.height - b.height),
+        videoRenditions: [...video.values()].sort((a, b) =>
+            a.height - b.height
+        ),
     };
 }
 
@@ -423,9 +425,10 @@ export function pullSabrTrack(
         ...(sel.startAtMs ? { startAtMs: sel.startAtMs } : {}),
         // deno-lint-ignore no-explicit-any
     } as any).then((res: any) => ({
-        stream: (wantVideo
-            ? res.videoStream
-            : res.audioStream) as ReadableStream<Uint8Array>,
+        stream:
+            (wantVideo ? res.videoStream : res.audioStream) as ReadableStream<
+                Uint8Array
+            >,
         format: wantVideo
             ? res.selectedFormats.videoFormat
             : res.selectedFormats.audioFormat,

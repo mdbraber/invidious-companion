@@ -180,8 +180,8 @@ videoPlaybackProxy.get("/", async (c) => {
         }
     }
     if (exposedHeaders.length > 0) {
-        headersForResponse["access-control-expose-headers"] =
-            exposedHeaders.join(", ");
+        headersForResponse["access-control-expose-headers"] = exposedHeaders
+            .join(", ");
     }
 
     if (title) {

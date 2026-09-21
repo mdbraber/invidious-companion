@@ -250,11 +250,10 @@ async function prepare(
         `"${session.title}" ${session.durationSec}s — mode=${session.mode}, ${session.videoRenditions.length} rendition(s), ${session.audioTracks.length} audio track(s)`,
     );
 
-    const seedHeight = session.videoRenditions.some((r) =>
-            r.height === SEED_HEIGHT
-        )
-        ? SEED_HEIGHT
-        : session.videoRenditions[0]?.height;
+    const seedHeight =
+        session.videoRenditions.some((r) => r.height === SEED_HEIGHT)
+            ? SEED_HEIGHT
+            : session.videoRenditions[0]?.height;
 
     const chosen = wantAudio.length
         ? session.audioTracks.filter((a) =>
@@ -368,7 +367,7 @@ type Ctx = Context<{ Variables: HonoVariables }>;
 
 const guard = (c: Ctx): string => {
     const videoId = c.req.param("videoId");
-    if (!validateVideoId(videoId)) {
+    if (!videoId || !validateVideoId(videoId)) {
         throw new HTTPException(400, {
             res: new Response("Invalid video ID format."),
         });
@@ -380,7 +379,9 @@ const guard = (c: Ctx): string => {
             throw new HTTPException(400, { res: new Response("No check ID.") });
         }
         if (verifyRequest(check, videoId, config) === false) {
-            throw new HTTPException(400, { res: new Response("ID incorrect.") });
+            throw new HTTPException(400, {
+                res: new Response("ID incorrect."),
+            });
         }
     }
     return videoId;
@@ -413,7 +414,9 @@ sabrRoutes.get("/:videoId/watch", (c) => {
     // Sibling of this route: /sabr/<id>/watch -> /sabr/<id>/manifest.mpd
     const manifest = `manifest.mpd${
         audio
-            ? (q ? `${q}&audio=${encodeURIComponent(audio)}` : `?audio=${encodeURIComponent(audio)}`)
+            ? (q
+                ? `${q}&audio=${encodeURIComponent(audio)}`
+                : `?audio=${encodeURIComponent(audio)}`)
             : q
     }`;
 
@@ -453,7 +456,9 @@ sabrRoutes.get("/:videoId/watch", (c) => {
     document.getElementById('log').appendChild(d);
   };
   var player = dashjs.MediaPlayer().create();
-  player.initialize(document.getElementById('v'), ${JSON.stringify(manifest)}, true);
+  player.initialize(document.getElementById('v'), ${
+        JSON.stringify(manifest)
+    }, true);
   player.updateSettings({ streaming: { buffer: { fastSwitchEnabled: true } } });
 
   function fill(sel, items, label) {
@@ -583,7 +588,7 @@ sabrRoutes.get("/:videoId/download", (c) => {
  */
 sabrRoutes.get("/:videoId/live/:check/:rep/*", async (c) => {
     const videoId = c.req.param("videoId");
-    if (!validateVideoId(videoId)) {
+    if (!videoId || !validateVideoId(videoId)) {
         throw new HTTPException(400, {
             res: new Response("Invalid video ID format."),
         });
@@ -592,7 +597,9 @@ sabrRoutes.get("/:videoId/live/:check/:rep/*", async (c) => {
     const check = decodeURIComponent(c.req.param("check"));
     if (config.server.verify_requests) {
         if (check === "-" || verifyRequest(check, videoId, config) === false) {
-            throw new HTTPException(400, { res: new Response("ID incorrect.") });
+            throw new HTTPException(400, {
+                res: new Response("ID incorrect."),
+            });
         }
     }
 
@@ -606,7 +613,9 @@ sabrRoutes.get("/:videoId/live/:check/:rep/*", async (c) => {
     const base = await liveBaseUrl(videoId, rep);
     if (!base) {
         throw new HTTPException(404, {
-            res: new Response("Live manifest not held. Request the manifest first."),
+            res: new Response(
+                "Live manifest not held. Request the manifest first.",
+            ),
         });
     }
 
@@ -666,7 +675,9 @@ sabrRoutes.get("/:videoId/:track/:file", async (c) => {
     }
     if (!entry) {
         throw new HTTPException(404, {
-            res: new Response("Video not prepared. Request the manifest first."),
+            res: new Response(
+                "Video not prepared. Request the manifest first.",
+            ),
         });
     }
 

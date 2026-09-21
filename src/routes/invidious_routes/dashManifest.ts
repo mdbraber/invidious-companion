@@ -67,7 +67,9 @@ dashManifest.get("/:videoId", async (c) => {
     // manifest builds fine. Re-fetch uncached for these, so each request gets
     // a freshly minted token (this is what FreeTube effectively does by
     // minting a content po_token per playback).
-    if (videoInfo.basic_info?.is_post_live_dvr || videoInfo.basic_info?.is_live) {
+    if (
+        videoInfo.basic_info?.is_post_live_dvr || videoInfo.basic_info?.is_live
+    ) {
         const fresh = await youtubePlayerParsing({
             innertubeClient,
             videoId,
@@ -143,12 +145,12 @@ dashManifest.get("/:videoId", async (c) => {
                         queryParams.set("enc", "true");
                         queryParams.set("data", encryptedParams);
                     }
-                    const proxyBase =
-                        isPostLiveDvr && serverBaseUrl ? serverBaseUrl : "";
-                    dashUrl =
-                        (proxyBase + config.server.base_path +
-                            dashUrl.pathname + "?" +
-                            queryParams.toString()) as unknown as URL;
+                    const proxyBase = isPostLiveDvr && serverBaseUrl
+                        ? serverBaseUrl
+                        : "";
+                    dashUrl = (proxyBase + config.server.base_path +
+                        dashUrl.pathname + "?" +
+                        queryParams.toString()) as unknown as URL;
                     return dashUrl;
                 } else {
                     return dashUrl;

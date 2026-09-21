@@ -16,8 +16,11 @@
  * instead of quietly fetching the rest of the video.
  */
 import { Buffer } from "node:buffer";
-import { pullSabrTrack, type SabrPullSelection, type SabrSession } from "./session.ts";
-
+import {
+    pullSabrTrack,
+    type SabrPullSelection,
+    type SabrSession,
+} from "./session.ts";
 
 /** Segments retained behind the playhead, for small player rewinds. */
 const RETAIN = Number(Deno.env.get("SABR_RETAIN_SEGMENTS") || 12);
@@ -32,7 +35,7 @@ export interface TrackIndex {
     durations: number[];
     /** Byte size of each segment, so a byte range can map to a segment. */
     sizes: number[];
-    init: Uint8Array;
+    init: Uint8Array<ArrayBuffer>;
     /** Cumulative start time of each segment, in `timescale` units. */
     starts: number[];
 }
@@ -165,7 +168,7 @@ export async function fetchTrackIndex(
 class TrackReader {
     next: number;
     lastUsed = performance.now();
-    private segments = new Map<number, Uint8Array>();
+    private segments = new Map<number, Uint8Array<ArrayBuffer>>();
     private waiters = new Map<number, Array<() => void>>();
     private aborted = false;
     private failed?: Error;
@@ -201,7 +204,7 @@ class TrackReader {
         return reader;
     }
 
-    private publish(number: number, bytes: Uint8Array) {
+    private publish(number: number, bytes: Uint8Array<ArrayBuffer>) {
         if (this.segments.has(number)) return;
         this.segments.set(number, bytes);
         if (number >= this.next) this.next = number + 1;
@@ -271,7 +274,10 @@ class TrackReader {
     }
 
     /** Wait for segment `n`, or give up after `timeoutMs`. */
-    async segment(n: number, timeoutMs: number): Promise<Uint8Array | undefined> {
+    async segment(
+        n: number,
+        timeoutMs: number,
+    ): Promise<Uint8Array<ArrayBuffer> | undefined> {
         this.lastUsed = performance.now();
         const have = this.segments.get(n);
         if (have) return have;
@@ -346,7 +352,7 @@ export class ReaderPool {
         index: TrackIndex,
         n: number,
         timeoutMs: number,
-    ): Promise<Uint8Array | undefined> {
+    ): Promise<Uint8Array<ArrayBuffer> | undefined> {
         if (n < 1 || n > index.durations.length) return undefined;
 
         let reader = this.readers.find((r) => r.key === key && r.canReach(n));

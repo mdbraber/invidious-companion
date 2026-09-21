@@ -16,7 +16,9 @@
  * keeping the relative `<SegmentURL media="sq/…"/>` entries untouched, since
  * they resolve against it — turns it into a manifest our clients can play.
  */
-const MANIFEST_TTL_MS = Number(Deno.env.get("SABR_LIVE_MANIFEST_TTL_MS") || 20_000);
+const MANIFEST_TTL_MS = Number(
+    Deno.env.get("SABR_LIVE_MANIFEST_TTL_MS") || 20_000,
+);
 
 export interface LiveManifest {
     /** Manifest XML with BaseURLs rewritten to local paths. */
