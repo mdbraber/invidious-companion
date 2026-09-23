@@ -10,10 +10,11 @@
  * directory into a watch history with the content attached.
  *
  * So nothing is stored. A `TrackReader` is a live SABR stream positioned at
- * some segment, retaining only a short window behind the playhead. Sequential
- * playback reads from one reader; a seek beyond its window opens another. Idle
- * readers are aborted, which also means abandoning playback stops the download
- * instead of quietly fetching the rest of the video.
+ * some segment, retaining only a short window behind the playhead and pulling
+ * only a bounded window ahead of it (`AHEAD`). Sequential playback reads from
+ * one reader; a seek beyond its window opens another. Idle readers are
+ * aborted, which also means abandoning playback stops the download instead of
+ * quietly fetching the rest of the video.
  */
 import { Buffer } from "node:buffer";
 import {
@@ -28,6 +29,14 @@ const RETAIN = Number(Deno.env.get("SABR_RETAIN_SEGMENTS") || 12);
 const FORWARD_WINDOW = Number(Deno.env.get("SABR_FORWARD_WINDOW") || 24);
 /** Readers idle longer than this are aborted. */
 const IDLE_MS = Number(Deno.env.get("SABR_READER_IDLE_MS") || 45_000);
+/**
+ * Segments pulled beyond the newest one a client asked for before the pull
+ * is stopped. The server delivers at line speed and the library has no
+ * backpressure, so an unbounded reader holds the rest of the video in memory
+ * within seconds (a 1080p hour is over a gigabyte). Stopped readers keep what
+ * they hold; a request past it opens a new reader there, which costs ~50 ms.
+ */
+const AHEAD = Number(Deno.env.get("SABR_AHEAD_SEGMENTS") || 24);
 
 export interface TrackIndex {
     timescale: number;
@@ -169,6 +178,8 @@ export async function fetchTrackIndex(
 /** A live SABR stream positioned at a segment, retaining a short window. */
 class TrackReader {
     next: number;
+    /** The newest segment a client asked this reader for. */
+    private wanted: number;
     lastUsed = performance.now();
     private segments = new Map<number, Uint8Array<ArrayBuffer>>();
     private waiters = new Map<number, Array<() => void>>();
@@ -182,6 +193,7 @@ class TrackReader {
         private readonly abortFn: () => void,
     ) {
         this.next = startSegment;
+        this.wanted = startSegment;
     }
 
     static async open(
@@ -220,6 +232,8 @@ class TrackReader {
             this.waiters.delete(number);
             for (const fn of w) fn();
         }
+        // Far enough ahead of the player: stop pulling, keep what is held.
+        if (number >= this.wanted + AHEAD) this.abort();
     }
 
     private releaseAll() {
@@ -282,6 +296,7 @@ class TrackReader {
         timeoutMs: number,
     ): Promise<Uint8Array<ArrayBuffer> | undefined> {
         this.lastUsed = performance.now();
+        if (n > this.wanted) this.wanted = n;
         const have = this.segments.get(n);
         if (have) return have;
         if (this.failed || this.aborted) return undefined;
@@ -303,10 +318,10 @@ class TrackReader {
         return this.segments.get(n);
     }
 
-    /** True if this reader can reach `n` by reading forward, cheaply. */
+    /** True if this reader holds `n`, or can reach it by reading forward, cheaply. */
     canReach(n: number): boolean {
-        if (this.aborted || this.failed) return false;
         if (this.segments.has(n)) return true;
+        if (this.aborted || this.failed) return false;
         return n >= this.next && n - this.next <= FORWARD_WINDOW;
     }
 

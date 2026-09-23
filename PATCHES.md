@@ -60,7 +60,7 @@ segments).
 | `SABR_LIVE_MANIFEST_TTL_MS` | 20000 | re-fetch interval for YouTube's live manifest. We run **5000**: players only see segments the manifest lists. |
 | `SABR_POT_URL` | — | PO token provider for WEB sessions (dubbed audio); ANDROID_VR needs none |
 | `SABR_SEED_HEIGHT` / `SABR_MAX_HEIGHT` | 360 / 1080 | SABR VOD ladder |
-| `SABR_SEGMENT_WAIT_MS`, `SABR_SESSION_TTL_MS`, `SABR_RETAIN_SEGMENTS`, `SABR_FORWARD_WINDOW`, `SABR_READER_IDLE_MS` | see source | SABR VOD reader tuning |
+| `SABR_SEGMENT_WAIT_MS`, `SABR_SESSION_TTL_MS`, `SABR_RETAIN_SEGMENTS`, `SABR_AHEAD_SEGMENTS`, `SABR_FORWARD_WINDOW`, `SABR_READER_IDLE_MS` | see source | SABR VOD reader tuning; `SABR_AHEAD_SEGMENTS` (24) bounds how far a reader pulls past the newest segment a player asked for |
 
 ## Updating to a newer upstream
 
