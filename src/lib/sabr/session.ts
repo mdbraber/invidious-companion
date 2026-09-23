@@ -211,8 +211,13 @@ function describeTracks(formats: any[]) {
         });
     }
 
+    // The original track first: `prepare()` takes the first entry as the
+    // default audio, and a native response lists dubs before the original.
+    const audioTracks = [...audio.values()].sort((a, b) =>
+        Number(Boolean(a.isDubbed)) - Number(Boolean(b.isDubbed))
+    );
     return {
-        audioTracks: [...audio.values()],
+        audioTracks,
         videoRenditions: [...video.values()].sort((a, b) =>
             a.height - b.height
         ),
@@ -348,19 +353,27 @@ async function openVrSession(videoId: string): Promise<SabrSession> {
 // deno-lint-ignore no-explicit-any
 function nativeFormats(player: any) {
     // deno-lint-ignore no-explicit-any
-    return (player?.streamingData?.adaptiveFormats ?? []).map((f: any) =>
-        buildSabrFormat({
+    return (player?.streamingData?.adaptiveFormats ?? []).map((f: any) => {
+        // A native response describes audio tracks as
+        // `audioTrack: {id: "en-US.4", displayName, audioIsDefault, isAutoDubbed}`
+        // — the original carries `audioIsDefault: true`, every dub is
+        // another track. Map that onto the YouTube.js-style flags
+        // `buildSabrFormat` reads, so `describeTracks` and the audio
+        // selector can tell the original from the dubs.
+        const track = f.audioTrack;
+        return buildSabrFormat({
             ...f,
             is_drc: f.isDrc,
-            audio_track: f.audioTrack
-                ? {
-                    id: f.audioTrack.id,
-                    audio_is_default: f.audioTrack.audioIsDefault,
-                }
+            audio_track: track
+                ? { id: track.id, audio_is_default: track.audioIsDefault }
                 : undefined,
+            is_original: track ? Boolean(track.audioIsDefault) : undefined,
+            is_dubbed: track ? !track.audioIsDefault : undefined,
+            is_auto_dubbed: track?.isAutoDubbed,
+            language: track?.id?.split(".")[0],
             // deno-lint-ignore no-explicit-any
-        } as any)
-    );
+        } as any);
+    });
 }
 
 // deno-lint-ignore no-explicit-any
