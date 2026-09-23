@@ -123,6 +123,8 @@ source that is no longer on a branch is kept as a tag:
 
 | image | source |
 |---|---|
+| `2026.09.23-master-8ea6aec` | `master` @ `8ea6aec`: VISIONOS VOD sessions, pull abort, reload handling, bounded read-ahead (built and verified side by side 2026-09-23; deploy pending) |
+| `2026.09.23-camoufox-471fa2e` | `master` @ `471fa2e` (deployed 2026-09-23) |
 | `2026.09.21-master-ad8b441` | `master` @ `ad8b441` (deployed 2026-09-21) |
 | `2026.09.21-sabr-live-4090006` | tag `deployed/2026.09.21-sabr-live-4090006` |
 | `2026.07.29-dvrfix-captionfix` | the older `invidious-companion-dvrfix` tree |
