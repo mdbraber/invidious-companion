@@ -31,6 +31,14 @@ behind invidious.home.nedworks.org and serves OwnTube (see OwnTube's
   - `GET /sabr/:id/download?itag=`, `GET /sabr/:id/watch` (test player page).
   - Guarded by `SERVER_VERIFY_REQUESTS` like the other routes.
 - **Build**: the Dockerfile copies `vendor/` (the SABR code imports it).
+- **Upstream PR #360, carried ahead of upstream** (2026-09-23, one squashed
+  commit without its `.github/workflows` changes, which our push token may not
+  touch): PO tokens come from a headless Camoufox browser instead of JSDOM. On
+  2026-09-23 YouTube began rejecting every JSDOM token ("Failed to validate PO
+  token", and Invidious showing "This helps protect our community"); Camoufox
+  tokens validate. The image downloads Camoufox into the `/var/tmp/youtubei.js`
+  volume on first start, and the container needs `shm_size: 256mb`. Once
+  upstream merges #360, drop our squash commit when rebasing.
 
 Dropped when rebasing onto upstream `bb3b37f` (2026-09-21), because upstream now
 covers them: our captions fix (upstream `ffa2156` fetches the caption
