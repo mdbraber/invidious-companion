@@ -227,9 +227,8 @@ async function prepare(
     videoId: string,
     wantAudio: string[],
 ): Promise<Prepared> {
-    // A specific audio track was asked for, so the session must be able to
-    // offer more than the original — worth the WEB+pot latency. Otherwise
-    // ANDROID_VR, which is ~60x faster to index and seek.
+    // VISIONOS for VOD (random access works there; see session.ts). A dubbed
+    // track that VISIONOS does not list may still get a WEB+pot session.
     const session = await openSabrSession(videoId, wantAudio.length > 0);
     const log = (m: string) => console.log(`[INFO] [sabr] [${videoId}] ${m}`);
 

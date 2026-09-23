@@ -121,7 +121,7 @@ export async function fetchTrackIndex(
     session: SabrSession,
     sel: SabrPullSelection,
 ): Promise<{ index: TrackIndex; format: unknown }> {
-    const { stream, format } = await pullSabrTrack(session, sel);
+    const { stream, format, abort } = await pullSabrTrack(session, sel);
     const reader = stream.getReader();
     let buf = Buffer.alloc(0);
     const header: Buffer[] = [];
@@ -146,7 +146,9 @@ export async function fetchTrackIndex(
             if (sawMoof) break;
         }
     } finally {
-        // Abandon the rest of the stream; we only wanted the index.
+        // Abandon the rest of the stream; we only wanted the index. Abort the
+        // pull itself, not just the reader — see `SabrPull.abort`.
+        abort();
         try {
             await reader.cancel();
         } catch { /* already gone */ }
@@ -192,12 +194,13 @@ class TrackReader {
         const startMs = Math.floor(
             (index.starts[startSegment - 1] / index.timescale) * 1000,
         );
-        const { stream } = await pullSabrTrack(session, {
+        const { stream, abort } = await pullSabrTrack(session, {
             ...sel,
             ...(startSegment > 1 ? { startAtMs: startMs } : {}),
         });
         const streamReader = stream.getReader();
         const reader = new TrackReader(key, index, startSegment, () => {
+            abort();
             void streamReader.cancel().catch(() => {});
         });
         void reader.consume(streamReader);

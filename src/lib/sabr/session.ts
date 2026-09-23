@@ -1,7 +1,17 @@
 /**
  * SABR session + track pulling.
  *
- * Two ways to obtain a streaming session, in preference order:
+ * The session's client identity decides whether the server serves random
+ * access at all. Measured 2026-09-23 (owntube docs/LIVE-AND-DVR-PLAYBACK.md,
+ * "VOD via SABR"): **VISIONOS** — the visionOS YouTube app's client, no PO
+ * token needed, what NewPipeExtractor and LibreTube stream from — reports
+ * `STREAM_PROTECTION_STATUS` 1 on the first response and starts at any
+ * position in ~50 ms, on every video tried. ANDROID_VR refuses to start more
+ * than ~1 min into a video (empty answers, then a reload demand), and WEB
+ * with a Camoufox or headless-Chromium PO token is only verified on some
+ * videos; elsewhere it is cut off after ~48 s of media with "attestation
+ * required". So VOD sessions are VISIONOS, with the older paths kept as
+ * fallbacks:
  *
  *  1. **WEB with a proof-of-origin token.** Gives the full format list —
  *     every video height and every dubbed audio track. Requires a po_token
@@ -76,7 +86,7 @@ export interface SabrSession {
     /** YouTube's own dynamic manifest, for the live path. */
     dashManifestUrl?: string;
     /** Which path produced this session, for logging and manifest hints. */
-    mode: "web+pot" | "android_vr";
+    mode: "web+pot" | "android_vr" | "visionos";
 }
 
 const VR = {
@@ -103,6 +113,40 @@ const VR = {
         osName: "Android",
         osVersion: "12L",
         androidSdkVersion: 32,
+    },
+};
+
+/**
+ * The visionOS YouTube app, as NewPipeExtractor's `ofVisionOsClient()` sends
+ * it (ClientsConstants.java; bump these together with it). Talks to the
+ * `youtubei.googleapis.com` host with `X-Goog-Api-Format-Version: 2`.
+ */
+const VISION = {
+    id: 101,
+    version: "1.04",
+    model: "RealityDevice17,1",
+    osVersion: "26.6.0.23O770",
+    userAgent:
+        "com.google.visionos.youtube/1.04(RealityDevice17,1; U; CPU visionOS 26_6_0 like Mac OS X; US)",
+    context: {
+        clientName: "VISIONOS",
+        clientVersion: "1.04",
+        clientScreen: "WATCH",
+        deviceMake: "Apple",
+        deviceModel: "RealityDevice17,1",
+        osName: "visionOS",
+        osVersion: "26.6.0.23O770",
+        hl: "en",
+        gl: "US",
+        utcOffsetMinutes: 0,
+    },
+    clientInfo: {
+        clientName: 101,
+        clientVersion: "1.04",
+        deviceMake: "Apple",
+        deviceModel: "RealityDevice17,1",
+        osName: "visionOS",
+        osVersion: "26.6.0.23O770",
     },
 };
 
@@ -277,10 +321,34 @@ async function openVrSession(videoId: string): Promise<SabrSession> {
         throw new Error(`${videoId}: no SABR streaming url / ustreamer config`);
     }
 
-    // buildSabrFormat reads the raw camelCase player JSON directly; only drc
-    // and the audio-track id need aliasing to its snake_case fallbacks.
+    const formats = nativeFormats(player);
+
+    return {
+        videoId,
+        title: player?.videoDetails?.title ?? videoId,
+        durationSec: parseInt(player?.videoDetails?.lengthSeconds ?? "0"),
+        formats,
+        url,
+        ustreamer,
+        captions: nativeCaptions(player),
+        clientInfo: VR.clientInfo,
+        userAgent: VR.userAgent,
+        dashManifestUrl: player?.streamingData?.dashManifestUrl,
+        isLive: nativeIsLive(player),
+        mode: "android_vr",
+        ...describeTracks(formats),
+    };
+}
+
+/**
+ * A raw player response from a native (non-JS) client: no deciphering, no
+ * PO token. `buildSabrFormat` reads the camelCase JSON directly; only drc and
+ * the audio-track id need aliasing to its snake_case fallbacks.
+ */
+// deno-lint-ignore no-explicit-any
+function nativeFormats(player: any) {
     // deno-lint-ignore no-explicit-any
-    const formats = (player.streamingData.adaptiveFormats ?? []).map((f: any) =>
+    return (player?.streamingData?.adaptiveFormats ?? []).map((f: any) =>
         buildSabrFormat({
             ...f,
             is_drc: f.isDrc,
@@ -293,6 +361,78 @@ async function openVrSession(videoId: string): Promise<SabrSession> {
             // deno-lint-ignore no-explicit-any
         } as any)
     );
+}
+
+// deno-lint-ignore no-explicit-any
+function nativeCaptions(player: any): SabrCaptionTrack[] {
+    return dedupeCaptions(
+        (player?.captions?.playerCaptionsTracklistRenderer?.captionTracks ??
+            [])
+            // deno-lint-ignore no-explicit-any
+            .map((c: any) => ({
+                languageCode: c.languageCode,
+                label: c.name?.simpleText ?? c.name?.runs?.[0]?.text ??
+                    c.languageCode,
+            })),
+    );
+}
+
+// deno-lint-ignore no-explicit-any
+function nativeIsLive(player: any): boolean {
+    return Boolean(
+        player?.videoDetails?.isLive ||
+            player?.videoDetails?.isPostLiveDvr ||
+            player?.videoDetails?.isLiveContent &&
+                !parseInt(player?.videoDetails?.lengthSeconds ?? "0"),
+    );
+}
+
+/** VISIONOS: no token needed, random access works. The VOD default. */
+async function openVisionSession(videoId: string): Promise<SabrSession> {
+    const bootstrap = await Innertube.create({ retrieve_player: false });
+    const visitorData = bootstrap.session.context.client.visitorData;
+    if (!visitorData) throw new Error("no visitorData");
+
+    const res = await fetch(
+        "https://youtubei.googleapis.com/youtubei/v1/player?prettyPrint=false",
+        {
+            method: "POST",
+            headers: {
+                "content-type": "application/json",
+                "user-agent": VISION.userAgent,
+                "x-goog-api-format-version": "2",
+                "x-goog-visitor-id": visitorData,
+            },
+            body: JSON.stringify({
+                context: {
+                    client: { ...VISION.context, visitorData },
+                    request: { internalExperimentFlags: [], useSsl: true },
+                    user: { lockedSafetyMode: false },
+                },
+                videoId,
+                contentCheckOk: true,
+                racyCheckOk: true,
+            }),
+        },
+    );
+    // deno-lint-ignore no-explicit-any
+    const player: any = await res.json();
+
+    const status = player?.playabilityStatus?.status;
+    if (status !== "OK") {
+        throw new Error(
+            `${videoId}: playability ${status}: ${
+                player?.playabilityStatus?.reason ?? ""
+            }`,
+        );
+    }
+    const url = player?.streamingData?.serverAbrStreamingUrl;
+    const ustreamer = player?.playerConfig?.mediaCommonConfig
+        ?.mediaUstreamerRequestConfig?.videoPlaybackUstreamerConfig;
+    if (!url || !ustreamer) {
+        throw new Error(`${videoId}: no SABR streaming url / ustreamer config`);
+    }
+    const formats = nativeFormats(player);
 
     return {
         videoId,
@@ -301,55 +441,71 @@ async function openVrSession(videoId: string): Promise<SabrSession> {
         formats,
         url,
         ustreamer,
-        captions: dedupeCaptions(
-            (player?.captions?.playerCaptionsTracklistRenderer
-                ?.captionTracks ?? [])
-                // deno-lint-ignore no-explicit-any
-                .map((c: any) => ({
-                    languageCode: c.languageCode,
-                    label: c.name?.simpleText ?? c.name?.runs?.[0]?.text ??
-                        c.languageCode,
-                })),
-        ),
-        clientInfo: VR.clientInfo,
-        userAgent: VR.userAgent,
+        captions: nativeCaptions(player),
+        clientInfo: VISION.clientInfo,
+        userAgent: VISION.userAgent,
         dashManifestUrl: player?.streamingData?.dashManifestUrl,
-        isLive: Boolean(
-            player?.videoDetails?.isLive ||
-                player?.videoDetails?.isPostLiveDvr ||
-                player?.videoDetails?.isLiveContent &&
-                    !parseInt(player?.videoDetails?.lengthSeconds ?? "0"),
-        ),
-        mode: "android_vr",
+        isLive: nativeIsLive(player),
+        mode: "visionos",
         ...describeTracks(formats),
     };
 }
 
 /**
- * ANDROID_VR is preferred, and it is not close: measured against the same
- * video, indexing a track takes **69ms** on ANDROID_VR versus **4.1s** on
- * WEB+pot, and a seek 27–115ms versus ~4s. WEB is only worth that cost when
- * the request needs something ANDROID_VR cannot express — a dubbed audio
- * track, which its player response does not list at all.
+ * VOD: VISIONOS (see the header). Live and post-live DVR: ANDROID_VR, whose
+ * native manifest is what `lib/sabr/live.ts` proxies — that path is proven
+ * and left alone, at the cost of a second player request for a live video.
+ * WEB+pot is tried only when a dubbed track was asked for and VISIONOS did
+ * not list it; ANDROID_VR is the last resort for everything.
  *
- * @param needsFullFormats ask for WEB+pot because a dub was requested.
+ * @param needsFullFormats a dubbed audio track was requested.
  */
 export async function openSabrSession(
     videoId: string,
     needsFullFormats = false,
 ): Promise<SabrSession> {
-    if (needsFullFormats && POT_URL) {
+    let vision: SabrSession | undefined;
+    try {
+        vision = await openVisionSession(videoId);
+    } catch (err) {
+        console.log(
+            `[WARN] [sabr] [${videoId}] VISIONOS session failed (${
+                (err as Error).message
+            }); falling back`,
+        );
+    }
+    if (vision && !vision.isLive) {
+        if (!needsFullFormats || vision.audioTracks.length > 1 || !POT_URL) {
+            return vision;
+        }
+    }
+    if (needsFullFormats && POT_URL && !vision?.isLive) {
         try {
             return await openWebSession(videoId);
         } catch (err) {
             console.log(
                 `[WARN] [sabr] [${videoId}] WEB+pot session failed (${
                     (err as Error).message
-                }); falling back to ANDROID_VR, dubbed audio will be unavailable`,
+                }); falling back to ${
+                    vision ? "VISIONOS" : "ANDROID_VR"
+                }, dubbed audio will be unavailable`,
             );
+            if (vision) return vision;
         }
     }
     return await openVrSession(videoId);
+}
+
+/** Re-fetch the player response for a session, keeping its client. */
+function reopenSabrSession(session: SabrSession): Promise<SabrSession> {
+    switch (session.mode) {
+        case "visionos":
+            return openVisionSession(session.videoId);
+        case "web+pot":
+            return openWebSession(session.videoId);
+        default:
+            return openVrSession(session.videoId);
+    }
 }
 
 export interface SabrPullSelection {
@@ -364,15 +520,32 @@ export interface SabrPullSelection {
     startAtMs?: number;
 }
 
+export interface SabrPull {
+    stream: ReadableStream<Uint8Array>;
+    format: unknown;
+    /**
+     * Stop the pull. Cancelling the ReadableStream's reader is not enough:
+     * the library keeps fetching and retries ten times against the closed
+     * controller ("The stream controller cannot close or enqueue"), which is
+     * both load on YouTube and noise in the log.
+     */
+    abort: () => void;
+}
+
 /**
  * Pull one track as a stream of fMP4 bytes. The format *selectors* pin the
  * container — preference flags alone will still hand back WebM/Opus, which
  * cannot be cut into fMP4 segments.
+ *
+ * When the server asks for a player-response reload (streaming URLs expire,
+ * ~6 h), the session is re-opened with the same client and the pull's next
+ * retry uses the fresh URL; the shared session object is updated in place so
+ * later pulls start from it.
  */
 export function pullSabrTrack(
     session: SabrSession,
     sel: SabrPullSelection,
-): Promise<{ stream: ReadableStream<Uint8Array>; format: unknown }> {
+): Promise<SabrPull> {
     const stream = new SabrStream({
         formats: session.formats,
         serverAbrStreamingUrl: session.url,
@@ -415,6 +588,25 @@ export function pullSabrTrack(
         return video.find((f) => f.height === sel.height) ?? video[0];
     };
 
+    stream.on("reloadPlayerResponse", () => {
+        void reopenSabrSession(session).then((fresh) => {
+            session.url = fresh.url;
+            session.ustreamer = fresh.ustreamer;
+            session.formats = fresh.formats;
+            stream.setStreamingURL(fresh.url);
+            stream.setUstreamerConfig(fresh.ustreamer);
+            console.log(
+                `[INFO] [sabr] [${session.videoId}] player response reloaded (${fresh.mode})`,
+            );
+        }).catch((err) => {
+            console.log(
+                `[WARN] [sabr] [${session.videoId}] player response reload failed: ${
+                    (err as Error).message
+                }`,
+            );
+        });
+    });
+
     const wantVideo = sel.height !== null;
     return stream.start({
         videoFormat: videoFor,
@@ -432,5 +624,10 @@ export function pullSabrTrack(
         format: wantVideo
             ? res.selectedFormats.videoFormat
             : res.selectedFormats.audioFormat,
+        abort: () => {
+            try {
+                stream.abort();
+            } catch { /* already gone */ }
+        },
     }));
 }

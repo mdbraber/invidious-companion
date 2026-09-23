@@ -21,7 +21,14 @@ behind invidious.home.nedworks.org and serves OwnTube (see OwnTube's
   - absolute segment URLs in DVR manifests (upstream #249).
 - **SABR connector** (`src/lib/sabr/`, `src/routes/sabrRoutes.ts`, vendored
   `googlevideo` under `vendor/`, mapped via `gv/` in `deno.jsonc`), mounted at
-  `/sabr`:
+  `/sabr`. VOD sessions use the **VISIONOS** client (no PO token; the only
+  identity found on 2026-09-23 that the SABR server lets start mid-video —
+  ANDROID_VR refuses beyond ~1 min, WEB+Camoufox tokens fail attestation on most
+  videos; NewPipeExtractor/LibreTube stream from it too). Live keeps ANDROID_VR.
+  Its client constants mirror NewPipeExtractor's `ClientsConstants.java`; bump
+  them together. A pull is aborted through `SabrPull.abort()` (cancelling the
+  reader alone left the library retrying against a closed controller), and a
+  server reload request re-fetches the player response in place:
   - `GET /sabr/:id/manifest.mpd`: DASH for SABR-only VOD; for live and
     post-live DVR it proxies YouTube's own dynamic manifest from an ANDROID_VR
     session, BaseURLs rewritten to `live/<check>/<index>/`;
