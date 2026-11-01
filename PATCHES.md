@@ -123,6 +123,7 @@ source that is no longer on a branch is kept as a tag:
 
 | image | source |
 |---|---|
+| `2026.11.01-master-2e7b63f` | `master` @ `2e7b63f`: PO-token validation errors name YouTube's playability status/reason (deployed 2026-11-01, with `JOBS_YOUTUBE_SESSION_FREQUENCY=7 * * * *`, `cpus: 2`, `mem_limit: 6g`) |
 | `2026.09.23-master-8ea6aec` | `master` @ `8ea6aec`: VISIONOS VOD sessions, pull abort, reload handling, bounded read-ahead (built and verified side by side 2026-09-23; deploy pending) |
 | `2026.09.23-camoufox-471fa2e` | `master` @ `471fa2e` (deployed 2026-09-23) |
 | `2026.09.21-master-ad8b441` | `master` @ `ad8b441` (deployed 2026-09-21) |
