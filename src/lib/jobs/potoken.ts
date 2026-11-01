@@ -300,8 +300,10 @@ async function checkToken({
             throw new Error("No videos with valid IDs found in search results");
         }
 
-        // Try up to 3 random videos to validate the token
+        // Try up to 3 random videos to validate the token. Each failure is
+        // recorded so the final error says why, not just that it failed.
         const maxAttempts = Math.min(3, videos.length);
+        const failures: string[] = [];
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
             const video = videos[attempt];
 
@@ -335,8 +337,18 @@ async function checkToken({
                 const validFormat = videoInfo.streaming_data
                     ?.adaptive_formats[0];
                 if (!validFormat) {
+                    const playability = (youtubePlayerResponseJson as {
+                        playabilityStatus?: {
+                            status?: string;
+                            reason?: string;
+                        };
+                    }).playabilityStatus;
+                    const why = `no formats (playability ${
+                        playability?.status ?? "missing"
+                    }${playability?.reason ? `: ${playability.reason}` : ""})`;
+                    failures.push(`${video.id}: ${why}`);
                     console.log(
-                        `[WARN] No valid format found for video ${video.id}, trying next video`,
+                        `[WARN] No valid format found for video ${video.id}: ${why}, trying next video`,
                     );
                     continue;
                 }
@@ -346,6 +358,7 @@ async function checkToken({
                 });
 
                 if (result.status !== 200) {
+                    failures.push(`${video.id}: HTTP ${result.status}`);
                     console.log(
                         `[WARN] Got status ${result.status} for video ${video.id}, trying next video`,
                     );
@@ -374,7 +387,9 @@ async function checkToken({
         }
         // If we reach here, all attempts failed without throwing an exception
         throw new Error(
-            "Failed to validate PO token: all validation attempts returned non-200 status codes",
+            `Failed to validate PO token: no video validated (${
+                failures.join("; ")
+            })`,
         );
     } catch (err) {
         console.log("Failed to validate PO token using search method", { err });
