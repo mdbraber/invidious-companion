@@ -84,10 +84,24 @@ class CamoufoxPoTokenRuntime {
                 await createMinter(page, generationId, integrityToken);
                 this.generationIds.add(generationId);
 
+                // The session (GVS) PO token is bound to the visitor ID when
+                // logged out, but to the account's DataSync ID when signed in
+                // with cookies; a visitor-bound token makes every stream URL
+                // 403 for a signed-in session (yt-dlp does the same).
+                const dataSyncId = cookies
+                    ? await getDataSyncId(bootstrapClient)
+                    : undefined;
+                if (cookies) {
+                    console.log(
+                        dataSyncId
+                            ? "[INFO] Signed-in session: binding the PO token to the account DataSync ID"
+                            : "[WARN] Cookies are set but no DataSync ID was returned (signed out?); binding the PO token to visitor data",
+                    );
+                }
                 const sessionPoToken = await mintOnPage(
                     page,
                     generationId,
-                    visitorData,
+                    dataSyncId ?? visitorData,
                 );
                 let disposed = false;
 
@@ -372,4 +386,30 @@ function fingerprintOperatingSystem(): "linux" | "macos" | "windows" {
     if (Deno.build.os === "darwin") return "macos";
     if (Deno.build.os === "windows") return "windows";
     return "linux";
+}
+
+/** The signed-in account's DataSync ID, from any Innertube response context. */
+async function getDataSyncId(client: Innertube): Promise<string | undefined> {
+    try {
+        const response = await client.actions.execute(
+            "/account/account_menu",
+            { parse: false },
+        );
+        const data = response.data as {
+            responseContext?: {
+                mainAppWebResponseContext?: {
+                    datasyncId?: string;
+                    loggedOut?: boolean;
+                };
+            };
+        };
+        const context = data.responseContext?.mainAppWebResponseContext;
+        if (!context || context.loggedOut) return undefined;
+        return context.datasyncId || undefined;
+    } catch (err) {
+        console.log("[WARN] Could not read the DataSync ID", {
+            err: (err as Error).message,
+        });
+        return undefined;
+    }
 }
