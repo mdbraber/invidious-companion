@@ -31,6 +31,7 @@
  * request all agreeing. A response fetched under a blended identity gets its
  * streaming session classified as suspect and cut off after ~60s of media.
  */
+import { type SessionFetch, sessionFetch } from "./egress.ts";
 import { Innertube } from "youtubei.js";
 import { SabrStream } from "gv/sabr-stream.js";
 import { buildSabrFormat, EnabledTrackTypes } from "gv/utils.js";
@@ -59,6 +60,8 @@ export interface SabrVideoRendition {
 
 export interface SabrSession {
     videoId: string;
+    /** Egress for everything this session sends (see egress.ts). */
+    fetch?: SessionFetch;
     title: string;
     durationSec: number;
     // deno-lint-ignore no-explicit-any
@@ -225,15 +228,22 @@ function describeTracks(formats: any[]) {
 }
 
 /** WEB + po_token: the full ladder and every dubbed track. */
-async function openWebSession(videoId: string): Promise<SabrSession> {
+async function openWebSession(
+    videoId: string,
+    egress: SessionFetch = sessionFetch(),
+): Promise<SabrSession> {
     // The GVS token must be bound to the video id — see the note at the top.
     const poToken = await mintPoToken(videoId);
 
-    const bootstrap = await Innertube.create({ retrieve_player: false });
+    const bootstrap = await Innertube.create({
+        retrieve_player: false,
+        fetch: egress,
+    });
     const visitorData = bootstrap.session.context.client.visitorData;
     if (!visitorData) throw new Error("no visitorData");
 
     const innertube = await Innertube.create({
+        fetch: egress,
         po_token: poToken,
         visitor_data: visitorData,
     });
@@ -282,12 +292,18 @@ async function openWebSession(videoId: string): Promise<SabrSession> {
 }
 
 /** ANDROID_VR: no token needed, original audio track only. */
-async function openVrSession(videoId: string): Promise<SabrSession> {
-    const bootstrap = await Innertube.create({ retrieve_player: false });
+async function openVrSession(
+    videoId: string,
+    egress: SessionFetch = sessionFetch(),
+): Promise<SabrSession> {
+    const bootstrap = await Innertube.create({
+        retrieve_player: false,
+        fetch: egress,
+    });
     const visitorData = bootstrap.session.context.client.visitorData;
     if (!visitorData) throw new Error("no visitorData");
 
-    const res = await fetch(
+    const res = await egress(
         "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
         {
             method: "POST",
@@ -401,12 +417,18 @@ function nativeIsLive(player: any): boolean {
 }
 
 /** VISIONOS: no token needed, random access works. The VOD default. */
-async function openVisionSession(videoId: string): Promise<SabrSession> {
-    const bootstrap = await Innertube.create({ retrieve_player: false });
+async function openVisionSession(
+    videoId: string,
+    egress: SessionFetch = sessionFetch(),
+): Promise<SabrSession> {
+    const bootstrap = await Innertube.create({
+        retrieve_player: false,
+        fetch: egress,
+    });
     const visitorData = bootstrap.session.context.client.visitorData;
     if (!visitorData) throw new Error("no visitorData");
 
-    const res = await fetch(
+    const res = await egress(
         "https://youtubei.googleapis.com/youtubei/v1/player?prettyPrint=false",
         {
             method: "POST",
@@ -477,9 +499,20 @@ export async function openSabrSession(
     videoId: string,
     needsFullFormats = false,
 ): Promise<SabrSession> {
+    const egress = sessionFetch();
+    const s = await openSabrSessionWith(videoId, needsFullFormats, egress);
+    s.fetch = egress;
+    return s;
+}
+
+async function openSabrSessionWith(
+    videoId: string,
+    needsFullFormats: boolean,
+    egress: SessionFetch,
+): Promise<SabrSession> {
     let vision: SabrSession | undefined;
     try {
-        vision = await openVisionSession(videoId);
+        vision = await openVisionSession(videoId, egress);
     } catch (err) {
         console.log(
             `[WARN] [sabr] [${videoId}] VISIONOS session failed (${
@@ -494,7 +527,7 @@ export async function openSabrSession(
     }
     if (needsFullFormats && POT_URL && !vision?.isLive) {
         try {
-            return await openWebSession(videoId);
+            return await openWebSession(videoId, egress);
         } catch (err) {
             console.log(
                 `[WARN] [sabr] [${videoId}] WEB+pot session failed (${
@@ -506,19 +539,28 @@ export async function openSabrSession(
             if (vision) return vision;
         }
     }
-    return await openVrSession(videoId);
+    return await openVrSession(videoId, egress);
 }
 
 /** Re-fetch the player response for a session, keeping its client. */
-function reopenSabrSession(session: SabrSession): Promise<SabrSession> {
+async function reopenSabrSession(
+    session: SabrSession,
+): Promise<SabrSession> {
+    // Same egress address: the pull keeps streaming from it.
+    const egress = session.fetch ?? sessionFetch();
+    let fresh: SabrSession;
     switch (session.mode) {
         case "visionos":
-            return openVisionSession(session.videoId);
+            fresh = await openVisionSession(session.videoId, egress);
+            break;
         case "web+pot":
-            return openWebSession(session.videoId);
+            fresh = await openWebSession(session.videoId, egress);
+            break;
         default:
-            return openVrSession(session.videoId);
+            fresh = await openVrSession(session.videoId, egress);
     }
+    fresh.fetch = egress;
+    return fresh;
 }
 
 export interface SabrPullSelection {
@@ -566,19 +608,20 @@ export function pullSabrTrack(
         ...(session.poToken ? { poToken: session.poToken } : {}),
         // deno-lint-ignore no-explicit-any
         clientInfo: session.clientInfo as any,
-        ...(session.userAgent
-            ? {
-                // deno-lint-ignore no-explicit-any
-                fetch: (input: any, init?: any) =>
-                    fetch(input, {
+        // deno-lint-ignore no-explicit-any
+        fetch: (input: any, init?: any) =>
+            (session.fetch ?? fetch)(
+                input,
+                session.userAgent
+                    ? {
                         ...init,
                         headers: {
                             ...(init?.headers ?? {}),
                             "user-agent": session.userAgent,
                         },
-                    }),
-            }
-            : {}),
+                    }
+                    : init,
+            ),
     });
 
     // deno-lint-ignore no-explicit-any
