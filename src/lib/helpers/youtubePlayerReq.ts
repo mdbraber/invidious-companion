@@ -62,13 +62,16 @@ export const youtubePlayerReq = async (
         contentPoToken,
     );
 
-    // Check if the first adaptive format URL is undefined, if it is then fallback to multiple YT clients
+    // Fall back to other YT clients when the first adaptive format has no
+    // URL. A signatureCipher is fine: youtubePlayerParsing deciphers it.
+    const firstAdaptive = youtubePlayerResponse.data.streamingData
+        ?.adaptiveFormats?.[0];
 
     if (
         !innertubeClientOauthEnabled &&
-        youtubePlayerResponse.data.streamingData &&
-        youtubePlayerResponse.data.streamingData.adaptiveFormats[0].url ===
-            undefined
+        firstAdaptive &&
+        firstAdaptive.url === undefined &&
+        firstAdaptive.signatureCipher === undefined
     ) {
         console.log(
             "[WARNING] No URLs found for adaptive formats. Falling back to other YT clients.",
@@ -83,12 +86,25 @@ export const youtubePlayerReq = async (
             console.log(
                 `[WARNING] Trying fallback YT client ${innertubeClientType}`,
             );
-            const youtubePlayerResponseFallback = await callWatchEndpoint(
-                videoId,
-                innertubeClient,
-                innertubeClientType,
-                contentPoToken,
-            );
+            // One client failing (e.g. TV_SIMPLY answering 400 "Request
+            // contains an invalid argument" for signed-in sessions) must not
+            // stop the others from being tried.
+            let youtubePlayerResponseFallback: ApiResponse;
+            try {
+                youtubePlayerResponseFallback = await callWatchEndpoint(
+                    videoId,
+                    innertubeClient,
+                    innertubeClientType,
+                    contentPoToken,
+                );
+            } catch (err) {
+                console.log(
+                    `[WARNING] Fallback YT client ${innertubeClientType} failed: ${
+                        (err as Error).message
+                    }`,
+                );
+                continue;
+            }
             if (
                 youtubePlayerResponseFallback.data.streamingData && (
                     youtubePlayerResponseFallback.data.streamingData
@@ -106,6 +122,9 @@ export const youtubePlayerReq = async (
                 youtubePlayerResponse.data.streamingData.adaptiveFormats =
                     youtubePlayerResponseFallback.data.streamingData
                         .adaptiveFormats;
+                console.log(
+                    `[INFO] Using formats from fallback YT client ${innertubeClientType}`,
+                );
                 break;
             }
         }

@@ -155,7 +155,16 @@ export async function parseConfig() {
         const rawConfig = configFileContents ? parse(configFileContents) : {};
         const validatedConfig = ConfigSchema.parse(rawConfig);
 
-        console.log("Loaded Configuration", validatedConfig);
+        // Never log credentials: the session cookies log a whole Google
+        // account in, and the secret key signs every guarded request.
+        const redacted = structuredClone(validatedConfig);
+        if (redacted.server.secret_key) {
+            redacted.server.secret_key = "[redacted]";
+        }
+        if (redacted.youtube_session.cookies) {
+            redacted.youtube_session.cookies = "[redacted]";
+        }
+        console.log("Loaded Configuration", redacted);
 
         return validatedConfig;
     } catch (err) {
