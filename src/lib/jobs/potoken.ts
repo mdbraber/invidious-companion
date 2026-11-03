@@ -353,11 +353,15 @@ async function checkToken({
                     continue;
                 }
 
+                // A two-byte GET, not HEAD: googlevideo now refuses HEAD on
+                // some stream URLs (seen 2026-11-03) while serving the data.
                 const result = await fetchImpl(validFormat?.url, {
-                    method: "HEAD",
+                    method: "GET",
+                    headers: { range: "bytes=0-1" },
                 });
+                await result.body?.cancel();
 
-                if (result.status !== 200) {
+                if (result.status !== 200 && result.status !== 206) {
                     failures.push(`${video.id}: HTTP ${result.status}`);
                     console.log(
                         `[WARN] Got status ${result.status} for video ${video.id}, trying next video`,
