@@ -123,6 +123,7 @@ source that is no longer on a branch is kept as a tag:
 
 | image | source |
 |---|---|
+| `2026.11.03-master-7421b77` | `master` @ `7421b77`: PO-token validation by two-byte ranged GET (200/206). Deployed 2026-11-03 **anonymous** (cookies env_file commented out) with `/etc/gai.conf` from `companion-gai.conf` so YouTube is reached over IPv6: our IPv4 is flagged "not a bot", the IPv6 exit 2a02:a45d:15fe:15::11 is not. Working: PO token validates, `/youtubei/v1/player` and `/sabr` serve uncached videos |
 | `2026.11.03-master-4638bf8` | `master` @ `4638bf8`: fallback clients keep going when one throws, signatureCipher formats are not a fallback reason, config dump redacts cookies and secret key, signed-in session PO token bound to the DataSync ID (deployed 2026-11-03 with `env_file: ./companion-cookies.env`). Signed-in MWEB stream URLs still 403 on HEAD as of 2026-11-03 |
 | `2026.11.01-master-2e7b63f` | `master` @ `2e7b63f`: PO-token validation errors name YouTube's playability status/reason (deployed 2026-11-01, with `JOBS_YOUTUBE_SESSION_FREQUENCY=7 * * * *`, `cpus: 2`, `mem_limit: 6g`) |
 | `2026.09.23-master-8ea6aec` | `master` @ `8ea6aec`: VISIONOS VOD sessions, pull abort, reload handling, bounded read-ahead (built and verified side by side 2026-09-23; deploy pending) |
