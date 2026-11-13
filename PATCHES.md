@@ -37,6 +37,13 @@ behind invidious.home.nedworks.org and serves OwnTube (see OwnTube's
   - `GET /sabr/:id/:track/(init.mp4|seg-N.m4s)`: VOD segments;
   - `GET /sabr/:id/download?itag=`, `GET /sabr/:id/watch` (test player page).
   - Guarded by `SERVER_VERIFY_REQUESTS` like the other routes.
+- **`/videoplayback` keeps the stream URL's address**
+  (`src/routes/videoPlaybackProxy.ts`, `getFetchClient`'s `localAddress`
+  option): with `NETWORKING_IPV6_BLOCK` set, the proxy sends a segment's HEAD,
+  redirects and POST from the URL's own `ip=` when that address is inside the
+  block, instead of a new random one per request. Before this, YouTube served
+  a URL for ~50–70 segments and then revoked it (every later segment 403, hours
+  before `expire`), which stalled OwnTube's HLS playback.
 - **Build**: the Dockerfile copies `vendor/` (the SABR code imports it).
 - **Upstream PR #360, carried ahead of upstream** (2026-09-23, one squashed
   commit without its `.github/workflows` changes, which our push token may not

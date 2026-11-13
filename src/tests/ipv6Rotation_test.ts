@@ -1,5 +1,8 @@
 import { assertEquals, assertThrows } from "./deps.ts";
-import { generateRandomIPv6 } from "../lib/helpers/ipv6Rotation.ts";
+import {
+    generateRandomIPv6,
+    isIPv6InBlock,
+} from "../lib/helpers/ipv6Rotation.ts";
 
 Deno.test("generateRandomIPv6 - generates valid IPv6 addresses", () => {
     const ipv6Block = "2001:db8::/32";
@@ -67,4 +70,34 @@ Deno.test("generateRandomIPv6 - handles compressed IPv6 notation", () => {
     assertEquals(parts.length >= 3, true); // At least some parts should be present
     assertEquals(parts[0], "2001");
     assertEquals(parts[1], "db8");
+});
+
+Deno.test("isIPv6InBlock - matches addresses inside the block only", () => {
+    const block = "2a02:a45d:15fe:15:fffe::/80";
+    assertEquals(
+        isIPv6InBlock("2a02:a45d:15fe:15:fffe:e473:8d35:b463", block),
+        true,
+    );
+    assertEquals(isIPv6InBlock("2a02:a45d:15fe:15:fffe::1", block), true);
+    // Same /64, outside the /80.
+    assertEquals(
+        isIPv6InBlock("2a02:a45d:15fe:15:ffff:e473:8d35:b463", block),
+        false,
+    );
+    assertEquals(isIPv6InBlock("2a02:a45d:15fe:15::11", block), false);
+    // Every generated address is inside its block.
+    for (let i = 0; i < 100; i++) {
+        assertEquals(isIPv6InBlock(generateRandomIPv6(block), block), true);
+    }
+});
+
+Deno.test("isIPv6InBlock - rejects what is not an IPv6 address", () => {
+    const block = "2001:db8::/32";
+    assertEquals(isIPv6InBlock("77.171.108.25", block), false);
+    assertEquals(isIPv6InBlock("", block), false);
+    assertEquals(isIPv6InBlock("2001:db8::1::2", block), false);
+    assertEquals(isIPv6InBlock("2001:db8:0:0:0:0:0:0:1", block), false);
+    assertEquals(isIPv6InBlock("2001:db8::12345", block), false);
+    assertEquals(isIPv6InBlock("2001:db8::1%eth0", block), false);
+    assertEquals(isIPv6InBlock("2001:db8::1", "2001:db8::/129"), false);
 });

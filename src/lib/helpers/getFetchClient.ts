@@ -1,6 +1,6 @@
 import { retry, type RetryOptions } from "@std/async";
 import type { Config } from "./config.ts";
-import { generateRandomIPv6 } from "./ipv6Rotation.ts";
+import { generateRandomIPv6, isIPv6InBlock } from "./ipv6Rotation.ts";
 
 type FetchInputParameter = Parameters<typeof fetch>[0];
 type FetchInitParameterWithClient =
@@ -8,7 +8,16 @@ type FetchInitParameterWithClient =
     | RequestInit & { client: Deno.HttpClient };
 type FetchReturn = ReturnType<typeof fetch>;
 
-export const getFetchClient = (config: Config): {
+export type FetchClientOptions = {
+    /**
+     * Send every request from this address instead of a random one per
+     * request. Only honoured when it lies inside the configured IPv6 block;
+     * otherwise rotation behaves as usual.
+     */
+    localAddress?: string;
+};
+
+export const getFetchClient = (config: Config, options?: FetchClientOptions): {
     (
         input: FetchInputParameter,
         init?: FetchInitParameterWithClient,
@@ -16,6 +25,10 @@ export const getFetchClient = (config: Config): {
 } => {
     const proxyAddress = config.networking.proxy;
     const ipv6Block = config.networking.ipv6_block;
+    const pinnedAddress = ipv6Block && options?.localAddress &&
+            isIPv6InBlock(options.localAddress, ipv6Block)
+        ? options.localAddress
+        : undefined;
 
     const fetchMaxAttempts = config.networking.fetch?.retry?.times;
     const fetchInitialDebounce = config.networking.fetch?.retry
@@ -31,7 +44,7 @@ export const getFetchClient = (config: Config): {
 
     // If proxy or IPv6 rotation is configured, create a custom HTTP client
     // IPv6 rotation generates a unique localAddress for each request to help
-    // avoid YouTube's "Please login" errors
+    // avoid YouTube's "Please login" errors (unless the caller pinned one)
     if (proxyAddress || ipv6Block) {
         // For proxy-only (no IPv6 rotation), reuse a single client
         const reusableClient = proxyAddress && !ipv6Block
@@ -52,7 +65,8 @@ export const getFetchClient = (config: Config): {
                     clientOptions.proxy = { url: proxyAddress };
                 }
                 if (ipv6Block) {
-                    clientOptions.localAddress = generateRandomIPv6(ipv6Block);
+                    clientOptions.localAddress = pinnedAddress ??
+                        generateRandomIPv6(ipv6Block);
                 }
                 client = Deno.createHttpClient(clientOptions);
             }

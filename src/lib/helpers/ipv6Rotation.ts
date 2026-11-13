@@ -48,6 +48,36 @@ export function generateRandomIPv6(ipv6Block: string): string {
 }
 
 /**
+ * Whether `address` lies inside `ipv6Block` (CIDR notation). False for anything
+ * that is not a plain IPv6 address, an IPv4 address included.
+ */
+export function isIPv6InBlock(address: string, ipv6Block: string): boolean {
+    const [baseAddress, blockSize] = ipv6Block.split("/");
+    const blockBits = parseInt(blockSize, 10);
+    if (isNaN(blockBits) || blockBits < 1 || blockBits > 128) return false;
+    if (!/^[0-9a-fA-F:]+$/.test(address) || !address.includes(":")) {
+        return false;
+    }
+    const groups = address.split("::");
+    if (groups.length > 2) return false;
+    const count = groups.reduce(
+        (n, g) => n + (g ? g.split(":").length : 0),
+        0,
+    );
+    if (groups.length === 1 ? count !== 8 : count > 7) return false;
+    if (address.split(":").some((p) => p.length > 4)) return false;
+
+    const a = ipv6ToBytes(expandIPv6(address));
+    const b = ipv6ToBytes(expandIPv6(baseAddress));
+    for (let bit = 0; bit < blockBits; bit++) {
+        const i = bit >> 3;
+        const mask = 0x80 >> (bit & 7);
+        if ((a[i] & mask) !== (b[i] & mask)) return false;
+    }
+    return true;
+}
+
+/**
  * Expand an IPv6 address to its full form
  */
 function expandIPv6(address: string): string {

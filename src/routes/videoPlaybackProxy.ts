@@ -109,7 +109,15 @@ videoPlaybackProxy.get("/", async (c) => {
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
     }
 
-    const fetchClient = await getFetchClient(config);
+    // A stream URL is bound to the address that requested the player response
+    // (its `ip=`). With IPv6 rotation every request would otherwise leave from
+    // a different random address — even the HEAD, redirects and POST of one
+    // segment. YouTube tolerates that for a while, then revokes the URL
+    // mid-playback (every later segment 403s). So fetch from that very address
+    // when it is one of ours; getFetchClient ignores it if it is not.
+    const fetchClient = await getFetchClient(config, {
+        localAddress: queryParams.get("ip") ?? undefined,
+    });
 
     let headResponse: Response | undefined;
     let location = `https://${host}/videoplayback?${queryParams.toString()}`;
