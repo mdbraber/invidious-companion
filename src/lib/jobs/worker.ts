@@ -8,6 +8,8 @@ import { JSDOM } from "jsdom";
 import { Innertube } from "youtubei.js";
 import { PLAYER_ID } from "../../constants.ts";
 import { INTEGRITY_TOKEN_REQUEST_KEY } from "../potoken/constants.ts";
+import { applyYouTubeJsLogLevel } from "../helpers/logLevel.ts";
+applyYouTubeJsLogLevel();
 let getFetchClientLocation = "getFetchClient";
 if (Deno.env.get("GET_FETCH_CLIENT_LOCATION")) {
     if (Deno.env.has("DENO_COMPILED")) {

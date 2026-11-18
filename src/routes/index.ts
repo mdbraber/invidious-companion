@@ -10,6 +10,7 @@ import getDownloadHandler from "./invidious_routes/download.ts";
 import videoPlaybackProxy from "./videoPlaybackProxy.ts";
 import sabrRoutes from "./sabrRoutes.ts";
 import type { Config } from "../lib/helpers/config.ts";
+import { isQuietMediaPath } from "../lib/helpers/logLevel.ts";
 import metrics from "./metrics.ts";
 import health from "./health.ts";
 
@@ -22,11 +23,14 @@ export const companionRoutes = (
         console.log(message, ...rest);
     };
 
-    if (config.server.use_unix_socket) {
-        app.use("*", logger(loggerUnixSocket));
-    } else {
-        app.use("*", logger());
-    }
+    const requestLogger = config.server.use_unix_socket
+        ? logger(loggerUnixSocket)
+        : logger();
+    app.use(
+        "*",
+        (c, next) =>
+            isQuietMediaPath(c.req.path) ? next() : requestLogger(c, next),
+    );
 
     app.use(
         "/youtubei/v1/*",

@@ -17,6 +17,8 @@ const config = await parseConfig();
 import { Metrics } from "./lib/helpers/metrics.ts";
 import { PLAYER_ID } from "./constants.ts";
 import { jsInterpreter } from "./lib/helpers/jsInterpreter.ts";
+import { applyYouTubeJsLogLevel } from "./lib/helpers/logLevel.ts";
+applyYouTubeJsLogLevel();
 
 const args = parseArgs(Deno.args);
 
