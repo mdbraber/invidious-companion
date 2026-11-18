@@ -1,4 +1,7 @@
-import { generateRandomIPv6 } from "../helpers/ipv6Rotation.ts";
+import {
+    generateRandomIPv6,
+    watchPlayerResponse,
+} from "../helpers/ipv6Rotation.ts";
 
 /** The fetch a SABR session talks to YouTube with. */
 export type SessionFetch = typeof fetch;
@@ -18,9 +21,8 @@ const CLIENT_LIFETIME_MS = Number(
  */
 export function sessionFetch(): SessionFetch {
     if (!IPV6_BLOCK) return fetch;
-    const client = Deno.createHttpClient({
-        localAddress: generateRandomIPv6(IPV6_BLOCK),
-    });
+    const localAddress = generateRandomIPv6(IPV6_BLOCK);
+    const client = Deno.createHttpClient({ localAddress });
     const timer = setTimeout(() => {
         try {
             client.close();
@@ -29,9 +31,14 @@ export function sessionFetch(): SessionFetch {
         }
     }, CLIENT_LIFETIME_MS);
     Deno.unrefTimer(timer);
-    return ((input, init) =>
-        fetch(
+    return (async (input, init) => {
+        const res = await fetch(
             input,
             { ...(init ?? {}), client } as RequestInit,
-        )) as SessionFetch;
+        );
+        // A session whose player request draws "not a bot" flags its /64,
+        // so the next session (the route's retry) picks another one.
+        watchPlayerResponse(input, res, localAddress);
+        return res;
+    }) as SessionFetch;
 }

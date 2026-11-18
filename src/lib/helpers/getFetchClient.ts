@@ -1,6 +1,10 @@
 import { retry, type RetryOptions } from "@std/async";
 import type { Config } from "./config.ts";
-import { generateRandomIPv6, isIPv6InBlock } from "./ipv6Rotation.ts";
+import {
+    generateRandomIPv6,
+    isIPv6InBlock,
+    watchPlayerResponse,
+} from "./ipv6Rotation.ts";
 
 type FetchInputParameter = Parameters<typeof fetch>[0];
 type FetchInitParameterWithClient =
@@ -56,6 +60,7 @@ export const getFetchClient = (config: Config, options?: FetchClientOptions): {
             init?: RequestInit,
         ) => {
             let client: Deno.HttpClient;
+            let localAddress: string | undefined;
 
             if (reusableClient) {
                 client = reusableClient;
@@ -65,8 +70,9 @@ export const getFetchClient = (config: Config, options?: FetchClientOptions): {
                     clientOptions.proxy = { url: proxyAddress };
                 }
                 if (ipv6Block) {
-                    clientOptions.localAddress = pinnedAddress ??
+                    localAddress = pinnedAddress ??
                         generateRandomIPv6(ipv6Block);
+                    clientOptions.localAddress = localAddress;
                 }
                 client = Deno.createHttpClient(clientOptions);
             }
@@ -77,6 +83,9 @@ export const getFetchClient = (config: Config, options?: FetchClientOptions): {
                 method: init?.method,
                 body: init?.body,
             });
+
+            // Learn which /64s YouTube rejects as bots, so rotation skips them.
+            watchPlayerResponse(input, fetchRes, localAddress);
 
             // If using a reusable client, return directly without closing
             if (reusableClient) {

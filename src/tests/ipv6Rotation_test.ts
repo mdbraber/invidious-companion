@@ -1,7 +1,12 @@
 import { assertEquals, assertThrows } from "./deps.ts";
 import {
+    clearIPv6Flags,
     generateRandomIPv6,
+    isIPv6Flagged,
     isIPv6InBlock,
+    markIPv6Flagged,
+    prefix64,
+    watchPlayerResponse,
 } from "../lib/helpers/ipv6Rotation.ts";
 
 Deno.test("generateRandomIPv6 - generates valid IPv6 addresses", () => {
@@ -100,4 +105,103 @@ Deno.test("isIPv6InBlock - rejects what is not an IPv6 address", () => {
     assertEquals(isIPv6InBlock("2001:db8::12345", block), false);
     assertEquals(isIPv6InBlock("2001:db8::1%eth0", block), false);
     assertEquals(isIPv6InBlock("2001:db8::1", "2001:db8::/129"), false);
+});
+
+Deno.test("prefix64 - normalises to the /64", () => {
+    assertEquals(prefix64("2001:db8:0:f3c::1"), "2001:db8:0:f3c::/64");
+    assertEquals(
+        prefix64("2001:0db8:0000:0f3c:dead:beef:0:1"),
+        "2001:db8:0:f3c::/64",
+    );
+});
+
+Deno.test("generateRandomIPv6 - skips flagged /64s", () => {
+    clearIPv6Flags();
+    const block = "2001:db8:0:f00::/56";
+    // flag 255 of the 256 /64s; only 2001:db8:0:f42::/64 stays clean
+    for (let i = 0; i < 256; i++) {
+        if (i === 0x42) continue;
+        markIPv6Flagged(
+            `2001:db8:0:f${i.toString(16).padStart(2, "0")}::1`,
+            "test",
+        );
+    }
+    let clean = 0;
+    for (let i = 0; i < 200; i++) {
+        const addr = generateRandomIPv6(block);
+        assertEquals(isIPv6InBlock(addr, block), true);
+        if (prefix64(addr) === "2001:db8:0:f42::/64") clean++;
+    }
+    // 64 draws per call: P(miss the single clean /64) = (255/256)^64 ~ 78%,
+    // so expect ~44 of 200; what matters is that it is far above 200/256
+    assertEquals(clean > 15, true);
+    clearIPv6Flags();
+});
+
+Deno.test("generateRandomIPv6 - falls back when the whole block is flagged", () => {
+    clearIPv6Flags();
+    const block = "2001:db8:0:1::/64";
+    markIPv6Flagged("2001:db8:0:1::5", "test");
+    const addr = generateRandomIPv6(block);
+    assertEquals(isIPv6InBlock(addr, block), true);
+    assertEquals(isIPv6Flagged(addr), true);
+    clearIPv6Flags();
+});
+
+Deno.test("markIPv6Flagged - expires after the TTL", () => {
+    clearIPv6Flags();
+    const now = Date.now();
+    markIPv6Flagged("2001:db8:0:2::1", "test", now);
+    assertEquals(isIPv6Flagged("2001:db8:0:2::abcd", now + 1000), true);
+    assertEquals(isIPv6Flagged("2001:db8:0:3::1", now + 1000), false);
+    assertEquals(isIPv6Flagged("2001:db8:0:2::1", now + 25 * 3600_000), false);
+    clearIPv6Flags();
+});
+
+function playerResponse(status: string, reason: string): Response {
+    return new Response(
+        JSON.stringify({ playabilityStatus: { status, reason } }),
+        { status: 200, headers: { "content-type": "application/json" } },
+    );
+}
+
+async function settle(): Promise<void> {
+    await new Promise((r) => setTimeout(r, 20));
+}
+
+Deno.test("watchPlayerResponse - flags on 'not a bot' only", async () => {
+    clearIPv6Flags();
+    const url = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
+
+    const bot = playerResponse(
+        "LOGIN_REQUIRED",
+        "Sign in to confirm you’re not a bot",
+    );
+    watchPlayerResponse(url, bot, "2001:db8:0:10::1");
+    await bot.text(); // the caller still gets the whole body
+    await settle();
+    assertEquals(isIPv6Flagged("2001:db8:0:10::99"), true);
+
+    const age = playerResponse("LOGIN_REQUIRED", "Sign in to confirm your age");
+    watchPlayerResponse(url, age, "2001:db8:0:11::1");
+    await age.text();
+    await settle();
+    assertEquals(isIPv6Flagged("2001:db8:0:11::1"), false);
+
+    const ok = playerResponse("OK", "");
+    watchPlayerResponse(url, ok, "2001:db8:0:12::1");
+    await ok.text();
+    await settle();
+    assertEquals(isIPv6Flagged("2001:db8:0:12::1"), false);
+
+    const other = playerResponse("LOGIN_REQUIRED", "not a bot");
+    watchPlayerResponse(
+        "https://www.youtube.com/youtubei/v1/next",
+        other,
+        "2001:db8:0:13::1",
+    );
+    await other.text();
+    await settle();
+    assertEquals(isIPv6Flagged("2001:db8:0:13::1"), false);
+    clearIPv6Flags();
 });
