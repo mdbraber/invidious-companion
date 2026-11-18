@@ -77,6 +77,16 @@ covers them: our captions fix (upstream `ffa2156` fetches the caption
 (upstream `cc2503e` removed the byte-range chunking that emptied live
 segments).
 
+Merged upstream `07ae73c` on 2026-11-18 (merge `dc8d803`: YouTube.js 18.3.0,
+Deno 2.9.8, Hono 4.13.16, googlevideo 5.0.1, meriyah 7.4.1, @std/async 1.5.1).
+Upstream reverted `cc2503e` there (`6cb055d`: chunking no longer buffers on
+Deno 2.9.6+), so `/videoplayback` chunks again, which brought the empty-segment
+problem back. Carried on top in the merge: a request without Content-Length
+(`noclen` live/DVR segments) is fetched in one POST and streamed; a one-byte
+range counts as a chunk (`<=`); and the response is closed after the last chunk
+(`StreamingApi.pipe` keeps the stream open, so a length-less response never
+ended). Drop these when upstream fixes the same.
+
 ## Settings
 
 | env | default | |
@@ -150,6 +160,7 @@ source that is no longer on a branch is kept as a tag:
 
 | image | source |
 |---|---|
+| `2026.11.18-master-dc8d803` | `master` @ `dc8d803`: merge of upstream `07ae73c` (see above). Tested side by side 2026-11-18 (player, `/videoplayback` 1-byte/2-byte/12 MB ranges: 12 MB in 1.1 s chunked vs 14.1 s unchunked) and deployed; OwnTube HLS 200 for four videos. `noclen` live/DVR segments were not exercised (no such video at hand) |
 | `2026.11.18-master-3e20b25` | `master` @ `3e20b25`: rotation skips /64s YouTube answered "not a bot" (`NETWORKING_IPV6_FLAG_TTL_MS=86400000`). Deployed 2026-11-18 together with the block move: YouTube had flagged all of 2a02:a45d:15fe:15::/64, so `NETWORKING_IPV6_BLOCK=2a02:a45d:15fe:f00::/56`, a /56 outside every VLAN that OPNsense routes to naggon (gateway `NAGGON_MEDIA_V6` = 2a02:a45d:15fe:15::11, alias `NET_COMPANION_V6` in `EGRESS_OPEN`). ndppd stopped and disabled; `companion-ipv6-rotation` uses the /56. Verified: player and `/sabr` serve uncached videos, 11/11 rotation tests |
 | `2026.11.18-master-ffa12c2` | `master` @ `ffa12c2`: `YOUTUBEJS_LOG_LEVEL` (default error) and no request lines for media paths (`SERVER_LOG_MEDIA_REQUESTS`). Deployed 2026-11-18; the container now uses the daemon's log rotation (json-file 20m × 3) instead of 1G × 4 |
 | `2026.11.13-master-62bc59c` | `master` @ `62bc59c`: `/videoplayback` sends a segment's HEAD, redirects and POST from the stream URL's own `ip=` when it is inside `NETWORKING_IPV6_BLOCK`. Deployed 2026-11-13. Did not stop the TVHTML5_SIMPLY byte-range URLs being revoked after ~1 min of media (that is YouTube-side; OwnTube now plays VOD over `/sabr`), kept because the URL is bound to that address. Also: `companion-ipv6-rotation.service` now has `PartOf=docker.service` and a `docker.service.wants` link, after a docker stop left it down for a week |
