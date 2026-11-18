@@ -24,7 +24,7 @@ ARG THC_AMD64_SHA256='cb1797948015da46c222764a99ee30c06a6a9a30f5b87f212a28ea3c6d
 FROM debian:13-slim AS dependabot-debian
 
 # Retrieve the deno binary from the repository
-FROM denoland/deno:bin-2.9.2 AS deno-bin
+FROM denoland/deno:bin-2.9.8 AS deno-bin
 FROM golang:1.25-bookworm AS go-builder
 
 # Build the shell-free volume bootstrap used by the final image.

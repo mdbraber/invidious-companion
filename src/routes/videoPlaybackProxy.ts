@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { encodeRFC5987ValueChars } from "../lib/helpers/encodeRFC5987ValueChars.ts";
 import { decryptQuery } from "../lib/helpers/encryptQuery.ts";
+import { StreamingApi } from "hono/utils/stream";
 
 let getFetchClientLocation = "getFetchClient";
 if (Deno.env.get("GET_FETCH_CLIENT_LOCATION")) {
@@ -153,15 +154,78 @@ videoPlaybackProxy.get("/", async (c) => {
         });
     }
 
+    // =================== REQUEST CHUNKING =======================
+    // if the requested response is larger than the chunkSize, break up the response
+    // into chunks and stream the response back to the client to avoid rate limiting
+    const { readable, writable } = new TransformStream();
+    const stream = new StreamingApi(writable, readable);
     const googleVideoUrl = new URL(location);
-    const postResponse = await fetchClient(googleVideoUrl, {
-        method: "POST",
-        body: new Uint8Array([0x78, 0]), // protobuf: { 15: 0 } (no idea what it means but this is what YouTube uses),
-        headers: headersToSend,
-    });
-    if (postResponse.status !== 200) {
-        throw new Error("Non-200 response from google servers");
+    const getChunk = async (start: number, end: number) => {
+        googleVideoUrl.searchParams.set(
+            "range",
+            `${start}-${end}`,
+        );
+        const postResponse = await fetchClient(googleVideoUrl, {
+            method: "POST",
+            body: new Uint8Array([0x78, 0]), // protobuf: { 15: 0 } (no idea what it means but this is what YouTube uses),
+            headers: headersToSend,
+        });
+        if (postResponse.status !== 200) {
+            throw new Error("Non-200 response from google servers");
+        }
+        await stream.pipe(postResponse.body);
+    };
+
+    const chunkSize =
+        config.networking.videoplayback.video_fetch_chunk_size_mb * 1_000_000;
+    const totalBytes = Number(
+        headResponse.headers.get("Content-Length") || "0",
+    );
+
+    // if no range sent, the client wants thw whole file, i.e. for downloads
+    const wholeRequestStartByte = Number(firstByte || "0");
+    const wholeRequestEndByte = wholeRequestStartByte + Number(totalBytes) - 1;
+
+    let chunk = Promise.resolve();
+    if (!totalBytes) {
+        // Live / Post-Live-DVR segments carry `noclen=1` and no Content-Length,
+        // so there is nothing to chunk by: the loop below would not run and the
+        // response would be an empty 200. Fetch the segment in one POST, with
+        // the range the client asked for (already in the URL), and stream it.
+        chunk = (async () => {
+            const postResponse = await fetchClient(googleVideoUrl, {
+                method: "POST",
+                body: new Uint8Array([0x78, 0]),
+                headers: headersToSend,
+            });
+            if (postResponse.status !== 200) {
+                throw new Error("Non-200 response from google servers");
+            }
+            await stream.pipe(postResponse.body);
+        })();
     }
+    for (
+        let startByte = wholeRequestStartByte;
+        // `<=`: a one-byte range (start == end) is still one chunk
+        totalBytes && startByte <= wholeRequestEndByte;
+        startByte += chunkSize
+    ) {
+        // i.e.
+        // 0 - 4_999_999, then
+        // 5_000_000 - 9_999_999, then
+        // 10_000_000 - 14_999_999
+        let endByte = startByte + chunkSize - 1;
+        if (endByte > wholeRequestEndByte) {
+            endByte = wholeRequestEndByte;
+        }
+        chunk = chunk.then(() => getChunk(startByte, endByte));
+    }
+    // End the response after the last chunk: without a Content-Length (noclen)
+    // the client has no other way to know the segment is complete.
+    chunk.then(() => stream.close()).catch(() => {
+        stream.abort();
+    });
+    // =================== REQUEST CHUNKING =======================
 
     const headersForResponse: Record<string, string> = {
         "access-control-allow-origin": "*",
@@ -226,7 +290,7 @@ videoPlaybackProxy.get("/", async (c) => {
         }
     }
 
-    return new Response(postResponse.body, {
+    return new Response(stream.responseReadable, {
         status: responseStatus,
         statusText: headResponse.statusText,
         headers: headersForResponse,
