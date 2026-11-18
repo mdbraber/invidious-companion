@@ -44,6 +44,23 @@ behind invidious.home.nedworks.org and serves OwnTube (see OwnTube's
   block, instead of a new random one per request. Before this, YouTube served
   a URL for ~50–70 segments and then revoked it (every later segment 403, hours
   before `expire`), which stalled OwnTube's HLS playback.
+- **Rotation skips /64s YouTube flags** (`src/lib/helpers/ipv6Rotation.ts`,
+  hooked into `getFetchClient` and `src/lib/sabr/egress.ts`): YouTube's "Sign
+  in to confirm you're not a bot" sticks to a whole /64 (2026-11-18: all of
+  2a02:a45d:15fe:15::/64, while its neighbours stayed clean). Each
+  `/youtubei/v1/player` answer is read from a copy in the background; a
+  `LOGIN_REQUIRED` whose reason mentions a bot (not age checks) puts the
+  sending address's /64 on an in-memory list, and `generateRandomIPv6` draws
+  up to 64 times to miss listed /64s (if all are listed it uses one anyway and
+  warns at most every 10 min). Logs `[INFO] IPv6 <prefix>::/64 flagged by
+  YouTube (...)` once per /64. Only useful with a block wider than a /64; the
+  list is per isolate (the PO-token worker has its own) and a restart forgets
+  it. The request that drew the verdict still fails.
+- **Quieter logs** (`src/lib/helpers/logLevel.ts`): YouTube.js logs only
+  errors by default (its parser warnings dump ~45 lines of class source per
+  "X changed!" on every player request), and the request logger skips
+  `/videoplayback` and SABR segment requests, which arrive by the hundred per
+  video.
 - **Build**: the Dockerfile copies `vendor/` (the SABR code imports it).
 - **Upstream PR #360, carried ahead of upstream** (2026-09-23, one squashed
   commit without its `.github/workflows` changes, which our push token may not
@@ -66,6 +83,9 @@ segments).
 |---|---|---|
 | `SABR_LIVE_MANIFEST_TTL_MS` | 20000 | re-fetch interval for YouTube's live manifest. We run **5000**: players only see segments the manifest lists. |
 | `SABR_POT_URL` | — | PO token provider for WEB sessions (dubbed audio); ANDROID_VR needs none |
+| `NETWORKING_IPV6_FLAG_TTL_MS` | 86400000 | how long a /64 that drew "not a bot" is avoided by rotation |
+| `YOUTUBEJS_LOG_LEVEL` | error | `none`, `error`, `warning`, `info` or `debug`: YouTube.js log levels shown |
+| `SERVER_LOG_MEDIA_REQUESTS` | — | `true` logs `/videoplayback` and SABR segment requests again |
 | `SABR_SEED_HEIGHT` / `SABR_MAX_HEIGHT` | 360 / 1080 | SABR VOD ladder |
 | `SABR_SEGMENT_WAIT_MS`, `SABR_SESSION_TTL_MS`, `SABR_RETAIN_SEGMENTS`, `SABR_AHEAD_SEGMENTS`, `SABR_FORWARD_WINDOW`, `SABR_READER_IDLE_MS` | see source | SABR VOD reader tuning; `SABR_AHEAD_SEGMENTS` (24) bounds how far a reader pulls past the newest segment a player asked for |
 
@@ -130,6 +150,8 @@ source that is no longer on a branch is kept as a tag:
 
 | image | source |
 |---|---|
+| `2026.11.18-master-3e20b25` | `master` @ `3e20b25`: rotation skips /64s YouTube answered "not a bot" (`NETWORKING_IPV6_FLAG_TTL_MS=86400000`). Deployed 2026-11-18 together with the block move: YouTube had flagged all of 2a02:a45d:15fe:15::/64, so `NETWORKING_IPV6_BLOCK=2a02:a45d:15fe:f00::/56`, a /56 outside every VLAN that OPNsense routes to naggon (gateway `NAGGON_MEDIA_V6` = 2a02:a45d:15fe:15::11, alias `NET_COMPANION_V6` in `EGRESS_OPEN`). ndppd stopped and disabled; `companion-ipv6-rotation` uses the /56. Verified: player and `/sabr` serve uncached videos, 11/11 rotation tests |
+| `2026.11.18-master-ffa12c2` | `master` @ `ffa12c2`: `YOUTUBEJS_LOG_LEVEL` (default error) and no request lines for media paths (`SERVER_LOG_MEDIA_REQUESTS`). Deployed 2026-11-18; the container now uses the daemon's log rotation (json-file 20m × 3) instead of 1G × 4 |
 | `2026.11.13-master-62bc59c` | `master` @ `62bc59c`: `/videoplayback` sends a segment's HEAD, redirects and POST from the stream URL's own `ip=` when it is inside `NETWORKING_IPV6_BLOCK`. Deployed 2026-11-13. Did not stop the TVHTML5_SIMPLY byte-range URLs being revoked after ~1 min of media (that is YouTube-side; OwnTube now plays VOD over `/sabr`), kept because the URL is bound to that address. Also: `companion-ipv6-rotation.service` now has `PartOf=docker.service` and a `docker.service.wants` link, after a docker stop left it down for a week |
 | `2026.11.03-master-5432f07` | `master` @ `5432f07`: SABR sessions each use one random `NETWORKING_IPV6_BLOCK` address (`src/lib/sabr/egress.ts`). Deployed 2026-11-03 with `NETWORKING_IPV6_BLOCK=2a02:a45d:15fe:15:fffe::/80`, `sysctls: net.ipv6.ip_nonlocal_bind: 1`; host side: ndppd (`/etc/ndppd.conf`) + `companion-ipv6-rotation.service` |
 | `2026.11.03-master-7421b77` | `master` @ `7421b77`: PO-token validation by two-byte ranged GET (200/206). Deployed 2026-11-03 **anonymous** (cookies env_file commented out) with `/etc/gai.conf` from `companion-gai.conf` so YouTube is reached over IPv6: our IPv4 is flagged "not a bot", the IPv6 exit 2a02:a45d:15fe:15::11 is not. Working: PO token validates, `/youtubei/v1/player` and `/sabr` serve uncached videos |
