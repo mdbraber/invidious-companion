@@ -278,6 +278,7 @@ async function openWebSession(
 async function openVrSession(
     videoId: string,
     egress: SessionFetch = sessionFetch(),
+    reloadToken?: string,
 ): Promise<SabrSession> {
     const bootstrap = await Innertube.create({
         retrieve_player: false,
@@ -302,6 +303,7 @@ async function openVrSession(
                 videoId,
                 contentCheckOk: true,
                 racyCheckOk: true,
+                ...reloadPlaybackContext(reloadToken),
             }),
         },
     );
@@ -403,6 +405,7 @@ function nativeIsLive(player: any): boolean {
 async function openVisionSession(
     videoId: string,
     egress: SessionFetch = sessionFetch(),
+    reloadToken?: string,
 ): Promise<SabrSession> {
     const bootstrap = await Innertube.create({
         retrieve_player: false,
@@ -430,6 +433,7 @@ async function openVisionSession(
                 videoId,
                 contentCheckOk: true,
                 racyCheckOk: true,
+                ...reloadPlaybackContext(reloadToken),
             }),
         },
     );
@@ -467,6 +471,23 @@ async function openVisionSession(
         mode: "visionos",
         ...describeTracks(formats),
     };
+}
+
+/**
+ * A reload demand carries a token the next player request must echo. Without
+ * it YouTube answers the fresh session's first SABR request with another
+ * demand, on some videos every time (mjsMqasGhKU, 2026-11-20: ten reloads in
+ * a row, VISIONOS and ANDROID_VR alike, then the pull gave up and OwnTube fell
+ * back to byte-range URLs that are revoked ~1 min in).
+ */
+function reloadPlaybackContext(token?: string) {
+    return token
+        ? {
+            playbackContext: {
+                reloadPlaybackContext: { reloadPlaybackParams: { token } },
+            },
+        }
+        : {};
 }
 
 /**
@@ -528,19 +549,24 @@ async function openSabrSessionWith(
 /** Re-fetch the player response for a session, keeping its client. */
 async function reopenSabrSession(
     session: SabrSession,
+    reloadToken?: string,
 ): Promise<SabrSession> {
     // Same egress address: the pull keeps streaming from it.
     const egress = session.fetch ?? sessionFetch();
     let fresh: SabrSession;
     switch (session.mode) {
         case "visionos":
-            fresh = await openVisionSession(session.videoId, egress);
+            fresh = await openVisionSession(
+                session.videoId,
+                egress,
+                reloadToken,
+            );
             break;
         case "web+pot":
             fresh = await openWebSession(session.videoId, egress);
             break;
         default:
-            fresh = await openVrSession(session.videoId, egress);
+            fresh = await openVrSession(session.videoId, egress, reloadToken);
     }
     fresh.fetch = egress;
     return fresh;
@@ -632,8 +658,10 @@ export function pullSabrTrack(
         );
     };
 
-    stream.on("reloadPlayerResponse", () => {
-        void reopenSabrSession(session).then((fresh) => {
+    // deno-lint-ignore no-explicit-any
+    stream.on("reloadPlayerResponse", (ctx: any) => {
+        const token: string | undefined = ctx?.reloadPlaybackParams?.token;
+        void reopenSabrSession(session, token).then((fresh) => {
             session.url = fresh.url;
             session.ustreamer = fresh.ustreamer;
             session.formats = fresh.formats;
