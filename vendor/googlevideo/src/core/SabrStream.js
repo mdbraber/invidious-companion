@@ -237,7 +237,12 @@ export class SabrStream extends EventEmitterLike {
                 drcEnabled: audioFormat.isDrc,
                 clientViewportIsFlexible: false,
                 visibility: 1,
-                enabledTrackTypesBitfield
+                enabledTrackTypesBitfield,
+                // Our patch: lets the caller declare what it can decode. Without
+                // it the server assumes the client's (VISIONOS: HDR-capable)
+                // defaults and, on an HDR upload, answers a request for an SDR
+                // format with a player-response reload demand, every time.
+                ...(options.mediaCapabilities ? { mediaCapabilities: options.mediaCapabilities } : {})
             };
             // NOTE: 0 - video & audio, 1 - audio only, 2 - video only
             if (enabledTrackTypes === EnabledTrackTypes.AUDIO_ONLY || enabledTrackTypes === EnabledTrackTypes.VIDEO_ONLY) {

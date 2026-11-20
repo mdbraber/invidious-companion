@@ -572,6 +572,27 @@ async function reopenSabrSession(
     return fresh;
 }
 
+/**
+ * What a pull tells the server it can decode: 8-bit video only, no HDR. The
+ * ladder is H.264 SDR (see ladder.ts), but VISIONOS is taken to be
+ * HDR-capable, and on an HDR upload the server then refuses every SDR format
+ * with a player-response reload demand (mjsMqasGhKU, 2026-11-20: H.264 and
+ * 8-bit VP9 refused, VP9.2 and 10-bit AV1 served; with this declared, H.264
+ * is served). Codec values 1-3 cover the codecs YouTube numbers there; the
+ * caps are well above anything the ladder asks for.
+ */
+const SDR_MEDIA_CAPABILITIES = {
+    videoFormatCapabilities: [1, 2, 3].map((videoCodec) => ({
+        videoCodec,
+        maxHeight: 2160,
+        maxWidth: 3840,
+        maxFramerate: 60,
+        is10BitSupported: false,
+    })),
+    audioFormatCapabilities: [],
+    hdrModeBitmask: 0,
+};
+
 export interface SabrPullSelection {
     /** Exact video height to pull, or null for audio-only. */
     height?: number | null;
@@ -686,6 +707,7 @@ export function pullSabrTrack(
         enabledTrackTypes: wantVideo
             ? EnabledTrackTypes.VIDEO_ONLY
             : EnabledTrackTypes.AUDIO_ONLY,
+        ...(wantVideo ? { mediaCapabilities: SDR_MEDIA_CAPABILITIES } : {}),
         ...(sel.startAtMs ? { startAtMs: sel.startAtMs } : {}),
         // deno-lint-ignore no-explicit-any
     } as any).then((res: any) => ({
