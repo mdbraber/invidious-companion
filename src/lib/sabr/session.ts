@@ -35,6 +35,11 @@ import { type SessionFetch, sessionFetch } from "./egress.ts";
 import { Innertube } from "youtubei.js";
 import { SabrStream } from "gv/sabr-stream.js";
 import { buildSabrFormat, EnabledTrackTypes } from "gv/utils.js";
+import {
+    type SabrVideoRendition,
+    videoFormatForHeight,
+    videoLadder,
+} from "./ladder.ts";
 
 const POT_URL = Deno.env.get("SABR_POT_URL") || "";
 
@@ -50,13 +55,7 @@ export interface SabrCaptionTrack {
     label: string;
 }
 
-export interface SabrVideoRendition {
-    height: number;
-    width?: number;
-    itag: number;
-    bitrate: number;
-    mimeType: string;
-}
+export type { SabrVideoRendition } from "./ladder.ts";
 
 export interface SabrSession {
     videoId: string;
@@ -199,21 +198,6 @@ function describeTracks(formats: any[]) {
         });
     }
 
-    const video = new Map<number, SabrVideoRendition>();
-    // deno-lint-ignore no-explicit-any
-    for (const f of formats.filter((x: any) => x.width && isMp4(x))) {
-        // Keep the highest-bitrate format per height (there can be several).
-        const existing = video.get(f.height);
-        if (existing && existing.bitrate >= Number(f.bitrate ?? 0)) continue;
-        video.set(f.height, {
-            height: f.height,
-            width: f.width,
-            itag: f.itag,
-            bitrate: Number(f.bitrate ?? 0),
-            mimeType: f.mimeType ?? "",
-        });
-    }
-
     // The original track first: `prepare()` takes the first entry as the
     // default audio, and a native response lists dubs before the original.
     const audioTracks = [...audio.values()].sort((a, b) =>
@@ -221,9 +205,8 @@ function describeTracks(formats: any[]) {
     );
     return {
         audioTracks,
-        videoRenditions: [...video.values()].sort((a, b) =>
-            a.height - b.height
-        ),
+        // One codec, one format per height; see ladder.ts.
+        videoRenditions: videoLadder(formats),
     };
 }
 
@@ -639,9 +622,14 @@ export function pullSabrTrack(
     };
     // deno-lint-ignore no-explicit-any
     const videoFor = (fs: any[]) => {
-        const video = fs.filter((f) => isMp4(f) && f.width);
-        if (!sel.height) return video[0];
-        return video.find((f) => f.height === sel.height) ?? video[0];
+        if (!sel.height) return fs.find((f) => isMp4(f) && f.width);
+        // The format the manifest advertises for this height, not merely the
+        // first one listed at it (which can be another codec); see ladder.ts.
+        return videoFormatForHeight(
+            fs,
+            session.videoRenditions,
+            sel.height,
+        );
     };
 
     stream.on("reloadPlayerResponse", () => {

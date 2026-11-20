@@ -37,6 +37,13 @@ behind invidious.home.nedworks.org and serves OwnTube (see OwnTube's
   - `GET /sabr/:id/:track/(init.mp4|seg-N.m4s)`: VOD segments;
   - `GET /sabr/:id/download?itag=`, `GET /sabr/:id/watch` (test player page).
   - Guarded by `SERVER_VERIFY_REQUESTS` like the other routes.
+  - The VOD video ladder is **one codec** (H.264 whenever the video has it),
+    one format per height, and a height's segments are pulled by the itag the
+    manifest advertises (`src/lib/sabr/ladder.ts`). The ladder used to take the
+    highest-bitrate MP4 per height across codecs while the pull took the first
+    listed: at 144p AV1 itag 394 often out-bitrates H.264 itag 160, so the MPD
+    said `av01` for H.264 segments, and Media3 on a hardware-AV1 Android TV
+    played that lone "AV1" rung as a fixed track, stuck at 144p.
 - **`/videoplayback` keeps the stream URL's address**
   (`src/routes/videoPlaybackProxy.ts`, `getFetchClient`'s `localAddress`
   option): with `NETWORKING_IPV6_BLOCK` set, the proxy sends a segment's HEAD,
