@@ -60,12 +60,15 @@ export const MediaCapabilities = {
     },
 };
 function createBaseMediaCapabilities_VideoFormatCapability() {
-    return { videoCodec: 0, maxHeight: 0, maxWidth: 0, maxFramerate: 0, maxBitrateBps: 0, is10BitSupported: false };
+    return { videoCodec: 0, efficient: undefined, maxHeight: 0, maxWidth: 0, maxFramerate: 0, maxBitrateBps: 0, is10BitSupported: false };
 }
 export const MediaCapabilities_VideoFormatCapability = {
     encode(message, writer = new BinaryWriter()) {
         if (message.videoCodec !== undefined && message.videoCodec !== 0) {
             writer.uint32(8).int32(message.videoCodec);
+        }
+        if (message.efficient !== undefined) {
+            writer.uint32(16).bool(message.efficient);
         }
         if (message.maxHeight !== undefined && message.maxHeight !== 0) {
             writer.uint32(24).int32(message.maxHeight);
@@ -96,6 +99,13 @@ export const MediaCapabilities_VideoFormatCapability = {
                         break;
                     }
                     message.videoCodec = reader.int32();
+                    continue;
+                }
+                case 2: {
+                    if (tag !== 16) {
+                        break;
+                    }
+                    message.efficient = reader.bool();
                     continue;
                 }
                 case 3: {

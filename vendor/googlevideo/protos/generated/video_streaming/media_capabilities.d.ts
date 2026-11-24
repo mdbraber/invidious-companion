@@ -7,6 +7,8 @@ export interface MediaCapabilities {
 }
 export interface MediaCapabilities_VideoFormatCapability {
     videoCodec?: number | undefined;
+    /** Field 2 on the wire; yt-dlp's working SABR downloader sets it true on every codec (sabr PR #13515). */
+    efficient?: boolean | undefined;
     maxHeight?: number | undefined;
     maxWidth?: number | undefined;
     maxFramerate?: number | undefined;

@@ -573,21 +573,23 @@ async function reopenSabrSession(
 }
 
 /**
- * What a pull tells the server it can decode: 8-bit video only, no HDR. The
- * ladder is H.264 SDR (see ladder.ts), but VISIONOS is taken to be
- * HDR-capable, and on an HDR upload the server then refuses every SDR format
- * with a player-response reload demand (mjsMqasGhKU, 2026-11-20: H.264 and
- * 8-bit VP9 refused, VP9.2 and 10-bit AV1 served; with this declared, H.264
- * is served). Codec values 1-3 cover the codecs YouTube numbers there; the
- * caps are well above anything the ladder asks for.
+ * What a pull tells the server it can decode: SDR, no HDR. VISIONOS is taken
+ * to be HDR-capable, and on an HDR upload the server then refuses every SDR
+ * format with a player-response reload demand (mjsMqasGhKU, 2026-11-20:
+ * H.264 and 8-bit VP9 refused, VP9.2 and 10-bit AV1 served; with these caps
+ * declared, H.264 is served).
+ *
+ * Codec ids follow yt-dlp's VideoFormatCapability enum (sabr PR #13515),
+ * which its working SABR downloader sends: H264=2, VP9=4, AV1=8 — the old
+ * ids 1..3 (H263/H264/VP8) never claimed VP9 or AV1, and YouTube then
+ * refused >1080p AV1 pulls with sabr.no_video_selected (aqz-KE-bpKQ,
+ * 2026-11-24). Matches shape-with-hdrModeBitmask=0 SDR everywhere.
  */
 const SDR_MEDIA_CAPABILITIES = {
-    videoFormatCapabilities: [1, 2, 3].map((videoCodec) => ({
+    videoFormatCapabilities: [2, 4, 8].map((videoCodec) => ({
         videoCodec,
-        maxHeight: 2160,
-        maxWidth: 3840,
-        maxFramerate: 60,
-        is10BitSupported: false,
+        efficient: true,
+        is10BitSupported: true,
     })),
     audioFormatCapabilities: [],
     hdrModeBitmask: 0,
