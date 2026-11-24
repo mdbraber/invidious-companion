@@ -4,6 +4,7 @@ import {
     videoCodecFamily,
     videoFormatForHeight,
     videoLadder,
+    videoLadderForFamily,
 } from "../lib/sabr/ladder.ts";
 
 const fmt = (
@@ -163,4 +164,50 @@ Deno.test("every advertised rendition pulls a format of the advertised codec", (
         assertEquals(f.itag, r.itag);
         assertEquals(f.mimeType, r.mimeType);
     }
+});
+
+Deno.test("family ladders skip HDR formats (pulls declare SDR only)", () => {
+    // Shaped like mjsMqasGhKU: every height has SDR VP9, VP9.2 HDR and 10-bit
+    // AV1 HDR, the HDR ones at the higher bitrate.
+    const hdr = (itag: number, h: number, mime: string, bitrate: number) => ({
+        ...fmt(itag, h, "", bitrate),
+        mimeType: mime,
+        qualityLabel: `${h}p HDR`,
+    });
+    const formats = [
+        fmt(136, 720, "avc1.64001f", 2076613),
+        fmt(247, 720, "vp9", 749473, "webm"),
+        hdr(334, 720, 'video/webm; codecs="vp9.2"', 2016257),
+        hdr(
+            698,
+            720,
+            'video/mp4; codecs="av01.0.05M.10.0.110.09.18.09.0"',
+            2787509,
+        ),
+        fmt(313, 2160, "vp9", 12942220, "webm"),
+        hdr(337, 2160, 'video/webm; codecs="vp9.2"', 22597580),
+        hdr(
+            701,
+            2160,
+            'video/mp4; codecs="av01.0.12M.10.0.110.09.18.09.0"',
+            24295619,
+        ),
+        audio,
+    ];
+    assertEquals(
+        videoLadderForFamily(formats, "vp9").map((r) => r.itag),
+        [247, 313],
+    );
+    // No SDR AV1 at all: an empty family ladder, so the route serves the
+    // default ladder at once instead of trying an HDR pull.
+    assertEquals(videoLadderForFamily(formats, "av01"), []);
+    // SDR AV1 (8-bit) is kept.
+    assertEquals(
+        videoLadderForFamily(
+            [fmt(401, 2160, "av01.0.13M.08", 22000000)],
+            "av01",
+        )
+            .map((r) => r.itag),
+        [401],
+    );
 });

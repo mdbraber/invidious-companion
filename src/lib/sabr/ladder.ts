@@ -92,10 +92,25 @@ export function videoLadderForFamily(
     // them — see isVideo); "av01" is the mp4/AV1 ladder.
     const isFamily = (f: Format) =>
         Boolean(f?.width) &&
+        !isHdr(f) &&
         (family === "vp9"
             ? WEBM_VIDEO_MIME_RE.test(f?.mimeType ?? "")
             : isVideo(f) && videoCodecFamily(f?.mimeType ?? "") === family);
     return ladderOf(formats.filter(isFamily));
+}
+
+/**
+ * An HDR format: pulls declare SDR only (session.ts SDR_MEDIA_CAPABILITIES),
+ * so YouTube refuses these. They also carry the higher bitrate, so the
+ * highest-bitrate-per-height pick would choose them on an HDR upload
+ * (mjsMqasGhKU: VP9.2 330-337 and 10-bit AV1 694-701 over SDR VP9 278-313);
+ * the manifest then hung ~20 s on the seed pull and fell back to byte-range.
+ */
+export function isHdr(f: Format): boolean {
+    const mime = String(f?.mimeType ?? "");
+    return /HDR/.test(String(f?.qualityLabel ?? "")) ||
+        /codecs="(?:vp9\.2|vp09\.02)/.test(mime) ||
+        /codecs="av01\.\d+\.\d+[MH]\.10\b/.test(mime);
 }
 
 /**
