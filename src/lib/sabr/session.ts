@@ -598,6 +598,8 @@ const SDR_MEDIA_CAPABILITIES = {
 export interface SabrPullSelection {
     /** Exact video height to pull, or null for audio-only. */
     height?: number | null;
+    /** Exact itag to pull; overrides the default ladder's itag for `height`. */
+    itag?: number;
     audioTrackId?: string;
     /**
      * Start position, for resuming a partially cached track. Needs the seek
@@ -671,6 +673,9 @@ export function pullSabrTrack(
     };
     // deno-lint-ignore no-explicit-any
     const videoFor = (fs: any[]) => {
+        // An explicit itag (a non-default ladder family, e.g. the VP9/WebM
+        // ladder a Safari requests) wins over the default ladder.
+        if (sel.itag) return fs.find((f) => f.itag === sel.itag);
         if (!sel.height) return fs.find((f) => isMp4(f) && f.width);
         // The format the manifest advertises for this height, not merely the
         // first one listed at it (which can be another codec); see ladder.ts.

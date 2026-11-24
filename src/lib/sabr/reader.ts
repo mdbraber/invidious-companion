@@ -18,6 +18,12 @@
  */
 import { Buffer } from "node:buffer";
 import {
+    clusterTimecode,
+    EbmlCursor,
+    findFirstClusterOffset,
+    parseWebmInit,
+} from "./ebml.ts";
+import {
     pullSabrTrack,
     type SabrPullSelection,
     type SabrSession,
@@ -47,6 +53,8 @@ export interface TrackIndex {
     init: Uint8Array<ArrayBuffer>;
     /** Cumulative start time of each segment, in `timescale` units. */
     starts: number[];
+    /** True when the segments are WebM clusters rather than fMP4. */
+    webm: boolean;
 }
 
 function readBox(buf: Buffer, off: number) {
@@ -123,8 +131,15 @@ function parseSidx(
 }
 
 /**
- * Read just the init segment — which carries the `sidx` index of the whole
- * track — then stop. This is all the manifest needs, and costs one round trip.
+ * Read just the init portion of a track and derive its segment index. One
+ * pull, one round trip; the container is detected from the bytes themselves:
+ *
+ * - fMP4: init = boxes before the first `moof`, which carries a `sidx`
+ *   listing every segment (durations, sizes).
+ * - WebM (a VP9 pull from SABR arrives as a plain WebM stream): init =
+ *   elements before the first Cluster. Its Cues element lists every cluster,
+ *   so the SegmentTimeline also comes from the init alone. See
+ *   `parseWebmInit` (ebml.ts).
  */
 export async function fetchTrackIndex(
     session: SabrSession,
@@ -133,27 +148,66 @@ export async function fetchTrackIndex(
     const { stream, format, abort } = await pullSabrTrack(session, sel);
     const reader = stream.getReader();
     let buf = Buffer.alloc(0);
-    const header: Buffer[] = [];
     try {
+        let isWebm = false;
         for (;;) {
             const { done, value } = await reader.read();
             if (done) break;
             buf = Buffer.concat([buf, Buffer.from(value)]);
+            if (buf.length >= 4) {
+                isWebm = buf[0] === 0x1a && buf[1] === 0x45 &&
+                    buf[2] === 0xdf && buf[3] === 0xa3;
+            }
+
+            if (isWebm) {
+                const first = findFirstClusterOffset(buf);
+                if (first === null) continue;
+                const parsed = parseWebmInit(
+                    new Uint8Array(buf.subarray(0, first)),
+                );
+                if (!parsed) {
+                    throw new Error(
+                        `webm init (${first} bytes) carries no Cues index`,
+                    );
+                }
+                return { index: parsed, format };
+            }
+
+            // fMP4: init is everything before the first `moof`.
             let off = 0;
-            let sawMoof = false;
+            let boundary: number | null = null;
             for (;;) {
                 const box = readBox(buf, off);
                 if (!box) break;
                 if (box.type === "moof") {
-                    sawMoof = true;
+                    boundary = off;
                     break;
                 }
-                header.push(Buffer.from(buf.subarray(off, off + box.size)));
                 off += box.size;
             }
-            if (off > 0) buf = buf.subarray(off);
-            if (sawMoof) break;
+            if (boundary === null) continue;
+            const init = new Uint8Array(buf.subarray(0, boundary));
+            const parsed = parseSidx(init);
+            if (!parsed) throw new Error("track carries no sidx index");
+            const starts: number[] = [];
+            let acc = 0;
+            for (const d of parsed.durations) {
+                starts.push(acc);
+                acc += d;
+            }
+            return {
+                index: {
+                    timescale: parsed.timescale,
+                    durations: parsed.durations,
+                    sizes: parsed.sizes,
+                    init,
+                    starts,
+                    webm: false,
+                },
+                format,
+            };
         }
+        throw new Error("track ended before its first segment");
     } finally {
         // Abandon the rest of the stream; we only wanted the index. Abort the
         // pull itself, not just the reader — see `SabrPull.abort`.
@@ -162,18 +216,10 @@ export async function fetchTrackIndex(
             await reader.cancel();
         } catch { /* already gone */ }
     }
-
-    const init = new Uint8Array(Buffer.concat(header));
-    const parsed = parseSidx(init);
-    if (!parsed) throw new Error("track has no sidx index");
-    const starts: number[] = [];
-    let acc = 0;
-    for (const d of parsed.durations) {
-        starts.push(acc);
-        acc += d;
-    }
-    return { index: { ...parsed, init, starts }, format };
 }
+
+const EBML_SEGMENT = "18538067";
+const EBML_CLUSTER = "1f43b675";
 
 /** A live SABR stream positioned at a segment, retaining a short window. */
 class TrackReader {
@@ -241,9 +287,97 @@ class TrackReader {
         this.waiters.clear();
     }
 
+    /**
+     * WebM cut path. A DASH segment here is the run of Clusters from one
+     * CuePoint to the next (YouTube cues every ~4-7 s, but clusters are often
+     * shorter, so a segment usually spans several clusters). Each Cluster
+     * carries its own Timecode; one equal to a cue time (`index.starts`)
+     * opens segment n, and following clusters are appended until the
+     * segment's indexed byte size is reached or the next cue's cluster
+     * arrives. Clusters before the first cue boundary (a positioned pull
+     * begins at the cluster *containing* the time) are dropped.
+     *
+     * The pull re-sends the EBML header and the Segment start (whose size
+     * spans the whole file): skip the header, step into the Segment, skip
+     * SeekHead/Info/Tracks/Cues.
+     */
+    private async consumeWebm(
+        streamReader: ReadableStreamDefaultReader<Uint8Array>,
+    ) {
+        let buf = Buffer.alloc(0);
+        /** The segment being assembled: its number and clusters so far. */
+        let n = 0;
+        let parts: Buffer[] = [];
+        let bytes = 0;
+        const flush = () => {
+            if (n > 0) this.publish(n, new Uint8Array(Buffer.concat(parts)));
+            n = 0;
+            parts = [];
+            bytes = 0;
+        };
+        try {
+            for (;;) {
+                const { done, value } = await streamReader.read();
+                if (this.aborted) break;
+                if (done) {
+                    // A natural end completes the final segment.
+                    if (n === this.index.durations.length) flush();
+                    break;
+                }
+                buf = Buffer.concat([buf, Buffer.from(value)]);
+                const cur = new EbmlCursor(buf);
+                let off = 0;
+                for (;;) {
+                    const head = cur.id(off);
+                    if (!head) break;
+                    if (head.hex === EBML_SEGMENT) {
+                        // Step into the Segment: its children follow its size.
+                        const size = cur.size(off + head.length);
+                        if (!size) break;
+                        off += head.length + size.length;
+                        continue;
+                    }
+                    const el = cur.element(off);
+                    if (!el) {
+                        if (cur.size(off + head.length)?.unknown) {
+                            throw new Error(
+                                `webm element ${head.hex} has unknown size`,
+                            );
+                        }
+                        break; // header not fully arrived
+                    }
+                    const end = el.body + el.size;
+                    if (end > buf.length) break; // not fully arrived
+                    if (el.id === EBML_CLUSTER) {
+                        const raw = buf.subarray(off, end);
+                        const time = clusterTimecode(raw);
+                        const at = time === undefined ? 0 : this.index.starts
+                            .findIndex((s) => Math.abs(s - time) <= 2) + 1;
+                        if (at > 0) {
+                            flush();
+                            n = at;
+                        }
+                        if (n > 0) {
+                            parts.push(Buffer.from(raw));
+                            bytes += raw.length;
+                            if (bytes >= this.index.sizes[n - 1]) flush();
+                        }
+                    }
+                    off = end;
+                }
+                if (off > 0) buf = buf.subarray(off);
+            }
+        } catch (err) {
+            this.failed = err as Error;
+        } finally {
+            this.releaseAll();
+        }
+    }
+
     private async consume(
         streamReader: ReadableStreamDefaultReader<Uint8Array>,
     ) {
+        if (this.index.webm) return this.consumeWebm(streamReader);
         let buf = Buffer.alloc(0);
         let pendingMoof: Buffer | null = null;
         try {

@@ -12,16 +12,27 @@
  *   as a fixed track that never switches. An Amlogic Android TV stuck at 144p
  *   for whole videos was exactly that.
  * - The shared timeline is only verified across one encode family.
+
+ *
+ * Ladders are per request: the default (no family asked) is H.264 to
+ * SABR_MAX_HEIGHT, decoded by everything; `vp9` builds the WebM ladder
+ * (what the connector sliced into fMP4 cannot do — a VP9 pull arrives as a
+ * full WebM stream, segmented on Cue/Cluster boundaries instead); `av01` the
+ * mp4/AV1 one. >1080p is only reachable through a family ladder (YouTube has
+ * no H.264 above 1080p); the player asks for one after an MSE codec probe.
+ * See `videoLadderForFamily`.
  *
  * Before this, the manifest kept the highest-bitrate MP4 format per height
  * across codecs (at 144p that is often AV1 itag 394 over H.264 itag 160) while
  * the pull took the first format of that height, usually the H.264 one: the
  * MPD said `av01.0.00M.08` for segments that were `avc1.4D400C`.
  *
- * So: H.264 when the video has any (YouTube lists it for practically every
- * VOD), else the codec family that covers the most heights; within it the
+ * So the default ladder is H.264 when the video has any (YouTube lists it for
+ * practically every VOD; it decodes everywhere), else the codec family that covers the most heights; within it the
  * highest-bitrate format per height; and segments are pulled by that itag.
  */
+
+import { WEBM_VIDEO_MIME_RE } from "../../lib/sabr/ebml.ts";
 
 export interface SabrVideoRendition {
     height: number;
@@ -63,12 +74,46 @@ export function ladderCodecFamily(formats: Format[]): string {
     return best;
 }
 
-/** One rendition per height, single codec family, sorted by height. */
+/**
+ * One rendition per height, single codec family, sorted by height.
+ *
+ * `family` names an explicitly requested ladder ("vp9" for a Safari that
+ * needs WebM, "av01"/undefined for the default avc1-first auto choice).
+ */
+export function videoLadderForFamily(
+    formats: Format[],
+    family?: string,
+): SabrVideoRendition[] {
+    if (!family || (family !== "vp9" && family !== "av01")) {
+        return videoLadder(formats);
+    }
+    // A requested family ladder: "vp9" takes the WebM formats (served as
+    // WebM DASH to a VP9-capable browser; the default ladder never includes
+    // them — see isVideo); "av01" is the mp4/AV1 ladder.
+    const isFamily = (f: Format) =>
+        Boolean(f?.width) &&
+        (family === "vp9"
+            ? WEBM_VIDEO_MIME_RE.test(f?.mimeType ?? "")
+            : isVideo(f) && videoCodecFamily(f?.mimeType ?? "") === family);
+    return ladderOf(formats.filter(isFamily));
+}
+
+/**
+ * One rendition per height from one codec family — the auto default when no
+ * family was requested (avc1 when available), or that one family's rungs.
+ */
 export function videoLadder(formats: Format[]): SabrVideoRendition[] {
     const family = ladderCodecFamily(formats);
+    return ladderOf(
+        formats.filter((f) =>
+            isVideo(f) && videoCodecFamily(f?.mimeType ?? "") === family
+        ),
+    );
+}
+
+function ladderOf(familyFormats: Format[]): SabrVideoRendition[] {
     const byHeight = new Map<number, SabrVideoRendition>();
-    for (const f of formats.filter(isVideo)) {
-        if (videoCodecFamily(f.mimeType) !== family) continue;
+    for (const f of familyFormats) {
         // Keep the highest-bitrate format per height (there can be several).
         const existing = byHeight.get(f.height);
         if (existing && existing.bitrate >= Number(f.bitrate ?? 0)) continue;
@@ -94,7 +139,9 @@ export function videoFormatForHeight(
     ladder: SabrVideoRendition[],
     height: number,
 ): Format | undefined {
-    const video = formats.filter(isVideo);
+    // Every width-bearing format, WebM included: a family ladder (vp9) has
+    // WebM renditions, which the mp4-only `isVideo` would hide.
+    const video = formats.filter((f) => Boolean(f?.width));
     const rendition = ladder.find((r) => r.height === height);
     if (rendition) {
         const exact = video.find((f) => f.itag === rendition.itag);

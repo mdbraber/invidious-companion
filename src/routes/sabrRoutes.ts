@@ -49,6 +49,7 @@ import {
     type TrackIndex,
 } from "../lib/sabr/reader.ts";
 import { getLiveManifest, liveBaseUrl } from "../lib/sabr/live.ts";
+import { videoLadderForFamily } from "../lib/sabr/ladder.ts";
 
 /** Height indexed up front; other renditions are indexed on first request. */
 const SEED_HEIGHT = Number(Deno.env.get("SABR_SEED_HEIGHT") || 360);
@@ -134,25 +135,39 @@ ${opts.representations}
     </AdaptationSet>`;
 }
 
-function buildMpdTemplate(p: Prepared, audioTracks: TrackInfo[]): string {
+function buildMpdTemplate(
+    p: Prepared,
+    audioTracks: TrackInfo[],
+    family?: "vp9" | "av01",
+    familySeed?: TrackInfo,
+): string {
     const { session } = p;
-    const seed = p.seed!;
+    // A family ladder serves its own family's renditions on that family's
+    // seed timeline (indexed by the handler before this). Representation ids
+    // carry the family prefix (except the default ladder's), so the segment
+    // route can resolve the right itag per family.
+    const renditions = family
+        ? videoLadderForFamily(session.formats, family)
+        : session.videoRenditions;
+    const nonDefault = family !== undefined && renditions.length > 0;
+    const seed = nonDefault ? familySeed : p.seed!;
+    if (renditions.length === 0 || !seed) return "";
     const sets: string[] = [];
 
     // One video AdaptationSet holding the whole ladder, every rendition sharing
-    // the seed's timeline: fragment boundaries are identical across heights
-    // (verified — 288 fragments, 0.0000s drift between 144p and 720p) because
-    // they are cut from the same source encode. So only the seed needs
-    // indexing, and a mid-playback bitrate switch is just a request for a
-    // different Representation — no extra pull, nothing retained.
+    // the family seed's timeline: fragment boundaries are identical across
+    // heights of a family (verified — 288 fragments, 0.0000s drift between
+    // 144p and 720p), so only the seed needs indexing, and a mid-playback
+    // bitrate switch is just a request for a different Representation.
     {
-        const reps = session.videoRenditions
+        const reps = renditions
             .filter((r) => r.height <= MAX_HEIGHT)
             .map((r) => {
                 const c = parseCodec(r.mimeType);
-                return `      <Representation id="${
-                    videoTrackName(r.height)
-                }" codecs="${c.codecs}" width="${r.width}" height="${r.height}" bandwidth="${r.bitrate}"/>`;
+                const id = nonDefault
+                    ? `${family}-v${r.height}`
+                    : videoTrackName(r.height);
+                return `      <Representation id="${id}" codecs="${c.codecs}" width="${r.width}" height="${r.height}" bandwidth="${r.bitrate}"/>`;
             }).join("\n");
         sets.push(adaptationSet({
             mimeType: seed.mimeType,
@@ -340,14 +355,22 @@ function ensureTrack(
     const inFlight = p.pending.get(name);
     if (inFlight) return inFlight;
 
-    const videoMatch = /^v(\d+)$/.exec(name);
+    const videoMatch = /^(?:([a-z0-9]+)-)?v(\d+)$/.exec(name);
     if (!videoMatch) return undefined;
-    const height = Number(videoMatch[1]);
-    if (!p.session.videoRenditions.some((r) => r.height === height)) {
+    const family = videoMatch[1];
+    const height = Number(videoMatch[2]);
+    const ladders = family
+        ? videoLadderForFamily(p.session.formats, family)
+        : p.session.videoRenditions;
+    const rendition = ladders.find((r) => r.height === height);
+    if (!rendition) {
         return undefined;
     }
 
-    const promise = indexTrack(p.session, name, { height }, true)
+    const promise = indexTrack(p.session, name, {
+        height,
+        ...(family ? { itag: rendition.itag } : {}),
+    }, true)
         .then((t) => {
             p.tracks.set(name, t);
             p.pending.delete(name);
@@ -534,10 +557,31 @@ sabrRoutes.get("/:videoId/manifest.mpd", async (c) => {
     }
 
     const audioTracks = [...resolved.tracks.values()].filter((t) => !t.isVideo);
+
+    // The player's MSE probe picked a codec family (`video=vp9|av01`).
+    // A family gets its own ladder and its own seed timeline; without one
+    // (or when the video lacks that family) the default ladder serves.
+    const rawFamily = c.req.query("video");
+    let family: "vp9" | "av01" | undefined =
+        rawFamily === "vp9" || rawFamily === "av01" ? rawFamily : undefined;
+    let familySeed: TrackInfo | undefined;
+    if (family) {
+        const ladder = videoLadderForFamily(resolved.session.formats, family);
+        const seedRung = ladder.find((r) => r.height === SEED_HEIGHT) ??
+            ladder.find((r) => r.height <= 480);
+        familySeed = seedRung
+            ? await ensureTrack(
+                resolved,
+                `${family}-${videoTrackName(seedRung.height)}`,
+            )
+            : undefined;
+        if (!familySeed) family = undefined; // fall back to the default
+    }
+
     c.header("content-type", "application/dash+xml");
     c.header("access-control-allow-origin", "*");
     return c.body(
-        buildMpdTemplate(resolved, audioTracks)
+        buildMpdTemplate(resolved, audioTracks, family, familySeed)
             .replaceAll("%CHECKAMP%", amp)
             .replaceAll("%CHECK%", q),
     );
@@ -688,8 +732,10 @@ sabrRoutes.get("/:videoId/:track/:file", async (c) => {
     const t = await trackPromise;
 
     c.header("access-control-allow-origin", "*");
+    // WebM tracks (the vp9 family ladder) keep the .mp4/.m4s URL names of
+    // the shared SegmentTemplate; only the content type tells them apart.
     if (isInit) {
-        c.header("content-type", "video/mp4");
+        c.header("content-type", t.index.webm ? "video/webm" : "video/mp4");
         c.header("cache-control", "private, max-age=3600");
         return c.body(t.index.init);
     }
@@ -711,7 +757,10 @@ sabrRoutes.get("/:videoId/:track/:file", async (c) => {
             res: new Response("Segment not ready; retry."),
         });
     }
-    c.header("content-type", "video/iso.segment");
+    c.header(
+        "content-type",
+        t.index.webm ? "video/webm" : "video/iso.segment",
+    );
     c.header("cache-control", "private, max-age=3600");
     return c.body(bytes);
 });
