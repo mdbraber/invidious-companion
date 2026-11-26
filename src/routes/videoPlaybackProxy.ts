@@ -3,6 +3,11 @@ import { HTTPException } from "hono/http-exception";
 import { encodeRFC5987ValueChars } from "../lib/helpers/encodeRFC5987ValueChars.ts";
 import { decryptQuery } from "../lib/helpers/encryptQuery.ts";
 import { StreamingApi } from "hono/utils/stream";
+import {
+    refreshStreamUrl,
+    replacementFor,
+} from "../lib/helpers/streamUrlRefresh.ts";
+import { youtubePlayerParsing } from "../lib/helpers/youtubePlayerHandling.ts";
 
 let getFetchClientLocation = "getFetchClient";
 if (Deno.env.get("GET_FETCH_CLIENT_LOCATION")) {
@@ -110,18 +115,50 @@ videoPlaybackProxy.get("/", async (c) => {
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
     }
 
+    // The format this request is for: a revoked URL is replaced by a fresh
+    // one for the same format (see lib/helpers/streamUrlRefresh.ts).
+    const streamId = queryParams.get("id");
+    const itag = queryParams.get("itag");
+    const xtags = queryParams.get("xtags");
+    let targetHost = host;
+    const useUrl = (url: string) => {
+        const fresh = new URL(url);
+        const range = queryParams.get("range");
+        for (const key of [...queryParams.keys()]) queryParams.delete(key);
+        for (const [key, value] of fresh.searchParams) {
+            queryParams.append(key, value);
+        }
+        if (range) queryParams.set("range", range);
+        targetHost = fresh.host;
+    };
+    const known = replacementFor(streamId, itag, xtags);
+    if (known) useUrl(known);
+    const fetchPlayer = (videoId: string) =>
+        youtubePlayerParsing({
+            innertubeClient: c.get("innertubeClient"),
+            videoId,
+            config,
+            tokenMinter: c.get("tokenMinter")!,
+            metrics: c.get("metrics"),
+            refreshCache: true,
+        });
+
     // A stream URL is bound to the address that requested the player response
     // (its `ip=`). With IPv6 rotation every request would otherwise leave from
     // a different random address — even the HEAD, redirects and POST of one
     // segment. YouTube tolerates that for a while, then revokes the URL
     // mid-playback (every later segment 403s). So fetch from that very address
     // when it is one of ours; getFetchClient ignores it if it is not.
-    const fetchClient = await getFetchClient(config, {
-        localAddress: queryParams.get("ip") ?? undefined,
-    });
+    const clientFor = () =>
+        getFetchClient(config, {
+            localAddress: queryParams.get("ip") ?? undefined,
+        });
+    let fetchClient = await clientFor();
 
     let headResponse: Response | undefined;
-    let location = `https://${host}/videoplayback?${queryParams.toString()}`;
+    let location =
+        `https://${targetHost}/videoplayback?${queryParams.toString()}`;
+    let refreshed = false;
 
     // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-p2-semantics-17#section-7.3
     // A maximum of 5 redirections is defined in the note of the section 7.3
@@ -133,6 +170,30 @@ videoPlaybackProxy.get("/", async (c) => {
             redirect: "manual",
         });
         if (googlevideoResponse.status == 403) {
+            // Revoked (about a minute of media into the URL): once per
+            // request, swap in a fresh URL for the same format and retry.
+            if (!refreshed) {
+                refreshed = true;
+                await googlevideoResponse.body?.cancel();
+                const fresh = await refreshStreamUrl({
+                    streamId,
+                    itag,
+                    xtags,
+                    fetchPlayer,
+                });
+                if (fresh) {
+                    useUrl(fresh);
+                    fetchClient = await clientFor();
+                    location =
+                        `https://${targetHost}/videoplayback?${queryParams.toString()}`;
+                    i = -1; // a fresh redirect budget for the new URL
+                    continue;
+                }
+                return new Response(null, {
+                    status: googlevideoResponse.status,
+                    statusText: googlevideoResponse.statusText,
+                });
+            }
             return new Response(googlevideoResponse.body, {
                 status: googlevideoResponse.status,
                 statusText: googlevideoResponse.statusText,
@@ -171,6 +232,11 @@ videoPlaybackProxy.get("/", async (c) => {
             headers: headersToSend,
         });
         if (postResponse.status !== 200) {
+            // Revoked mid-response: have the replacement ready for the
+            // player's retry of this range.
+            if (postResponse.status === 403) {
+                void refreshStreamUrl({ streamId, itag, xtags, fetchPlayer });
+            }
             throw new Error("Non-200 response from google servers");
         }
         await stream.pipe(postResponse.body);

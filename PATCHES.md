@@ -70,6 +70,19 @@ behind invidious.home.nedworks.org and serves OwnTube (see OwnTube's
   address (the same /64 drew it and then OK, a listed /64 served VISIONOS
   fine), and with a stale PO token every WEB request draws it, so flagging on
   the first verdict listed 142 of the /56's 256 /64s in two hours.
+- **Revoked stream URLs are replaced** (`src/lib/helpers/streamUrlRefresh.ts`,
+  used by `src/routes/videoPlaybackProxy.ts`): YouTube revokes a byte-range
+  stream URL after about a minute of fetched media (every later range 403s),
+  so byte-range HLS and progressive MP4 stopped at ~1:00 (OwnTube's fallback
+  when SABR fails; every plain Invidious player). Every player response the
+  companion hands out is remembered as stream `id=` → videoId. On a 403 the
+  proxy fetches a fresh player response (`youtubePlayerParsing` with
+  `refreshCache`: skip the cached answer, store the fresh one), takes the same
+  itag (and `xtags`, the audio track) and retries the request once on it; later
+  requests carrying the revoked URL go to the replacement directly, and a 403
+  mid-response prepares the replacement for the player's retry. Bounded: one
+  refresh at a time per format, at most one per format every 20 s and 90 per
+  video per hour.
 - **One egress address per YouTube session** (`src/lib/helpers/youtubeSession.ts`,
   used by `getFetchClient`, `src/lib/jobs/potoken.ts`, `worker.ts`, `main.ts`
   and the live SABR path): per-request rotation spread one session over

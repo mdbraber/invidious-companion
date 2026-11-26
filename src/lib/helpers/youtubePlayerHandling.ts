@@ -18,6 +18,7 @@ const { youtubePlayerReq } = await import(youtubePlayerReqLocation);
 
 import type { Config } from "./config.ts";
 import { getKv } from "./kv.ts";
+import { rememberStreamUrls } from "./streamUrlRefresh.ts";
 
 export const youtubePlayerParsing = async ({
     innertubeClient,
@@ -26,22 +27,32 @@ export const youtubePlayerParsing = async ({
     tokenMinter,
     metrics,
     overrideCache = false,
+    refreshCache = false,
 }: {
     innertubeClient: Innertube;
     videoId: string;
     config: Config;
     tokenMinter: TokenMinter;
     metrics: Metrics | undefined;
+    /** Neither read nor write the cache (PO token validation). */
     overrideCache?: boolean;
+    /** Skip the cached answer but store the fresh one (revoked stream URLs). */
+    refreshCache?: boolean;
 }): Promise<object> => {
     const cacheEnabled = overrideCache ? false : config.cache.enabled;
+    const readCache = cacheEnabled && !refreshCache;
     const kv = await getKv(config);
 
-    const videoCached = (await kv.get(["video_cache", videoId]))
-        .value as Uint8Array;
+    const videoCached = readCache
+        ? (await kv.get(["video_cache", videoId])).value as Uint8Array
+        : null;
 
-    if (videoCached != null && cacheEnabled) {
-        return JSON.parse(new TextDecoder().decode(decompress(videoCached)));
+    if (videoCached != null) {
+        const cached = JSON.parse(
+            new TextDecoder().decode(decompress(videoCached)),
+        );
+        rememberStreamUrls(videoId, cached);
+        return cached;
     } else {
         const youtubePlayerResponse = await youtubePlayerReq(
             innertubeClient,
@@ -160,6 +171,7 @@ export const youtubePlayerParsing = async ({
             metrics?.checkInnertubeResponse(videoData);
         }
 
+        rememberStreamUrls(videoId, videoOnlyNecessaryInfo);
         return videoOnlyNecessaryInfo;
     }
 };
