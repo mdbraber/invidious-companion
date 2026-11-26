@@ -18,6 +18,11 @@ import { Metrics } from "./lib/helpers/metrics.ts";
 import { PLAYER_ID } from "./constants.ts";
 import { jsInterpreter } from "./lib/helpers/jsInterpreter.ts";
 import { applyYouTubeJsLogLevel } from "./lib/helpers/logLevel.ts";
+import {
+    commitSessionAddress,
+    drawSessionAddress,
+    onSessionRotationNeeded,
+} from "./lib/helpers/youtubeSession.ts";
 applyYouTubeJsLogLevel();
 
 const args = parseArgs(Deno.args);
@@ -79,14 +84,49 @@ if (!innertubeClientOauthEnabled) {
 
 Platform.shim.eval = jsInterpreter;
 
+// One egress address per YouTube session (see lib/helpers/youtubeSession.ts):
+// this first client gets its own, and is the live session until a PO token
+// session replaces it.
+const startAddress = drawSessionAddress(config.networking.ipv6_block);
 innertubeClient = await Innertube.create({
     enable_session_cache: false,
     retrieve_player: innertubeClientFetchPlayer,
-    fetch: getFetchClient(config),
+    fetch: getFetchClient(config, { localAddress: startAddress }),
     cookie: innertubeClientCookies || undefined,
     user_agent: USER_AGENT,
     player_id: PLAYER_ID,
 });
+commitSessionAddress(startAddress);
+
+/**
+ * Make a new YouTube session (a new PO token, or a new client without one) on
+ * a new address, and make it the live one only once it is ready: a failure
+ * leaves the current session in place.
+ */
+async function regenerateSession(): Promise<void> {
+    if (innertubeClientJobPoTokenEnabled) {
+        try {
+            const result = await poTokenGenerate(config, metrics);
+            innertubeClient = result.innertubeClient;
+            tokenMinter = result.tokenMinter;
+            commitSessionAddress(result.localAddress);
+        } catch (err) {
+            metrics?.potokenGenerationFailure.inc();
+            throw err;
+        }
+        return;
+    }
+    const localAddress = drawSessionAddress(config.networking.ipv6_block);
+    innertubeClient = await Innertube.create({
+        enable_session_cache: false,
+        fetch: getFetchClient(config, { localAddress }),
+        retrieve_player: innertubeClientFetchPlayer,
+        user_agent: USER_AGENT,
+        cookie: innertubeClientCookies || undefined,
+        player_id: PLAYER_ID,
+    });
+    commitSessionAddress(localAddress);
+}
 
 if (!innertubeClientOauthEnabled) {
     if (innertubeClientJobPoTokenEnabled) {
@@ -102,6 +142,7 @@ if (!innertubeClientOauthEnabled) {
         ).then((result) => {
             innertubeClient = result.innertubeClient;
             tokenMinter = result.tokenMinter;
+            commitSessionAddress(result.localAddress);
             tokenMinterReadyResolve?.();
         }).catch((err) => {
             console.error("[ERROR] Failed to initialize PO token:", err);
@@ -116,29 +157,18 @@ if (!innertubeClientOauthEnabled) {
         "regenerate youtube session",
         config.jobs.youtube_session.frequency,
         { backoffSchedule: [5_000, 15_000, 60_000, 180_000] },
-        async () => {
-            if (innertubeClientJobPoTokenEnabled) {
-                try {
-                    ({ innertubeClient, tokenMinter } = await poTokenGenerate(
-                        config,
-                        metrics,
-                    ));
-                } catch (err) {
-                    metrics?.potokenGenerationFailure.inc();
-                    throw err;
-                }
-            } else {
-                innertubeClient = await Innertube.create({
-                    enable_session_cache: false,
-                    fetch: getFetchClient(config),
-                    retrieve_player: innertubeClientFetchPlayer,
-                    user_agent: USER_AGENT,
-                    cookie: innertubeClientCookies || undefined,
-                    player_id: PLAYER_ID,
-                });
-            }
-        },
+        regenerateSession,
     );
+    // Rotate early when the live session's address goes bad (its /64 flagged,
+    // or a run of "not a bot" answers), instead of waiting for the cron.
+    onSessionRotationNeeded(() => {
+        regenerateSession().catch((err) => {
+            console.log(
+                "[WARN] Early YouTube session rotation failed; keeping the current session",
+                { err },
+            );
+        });
+    });
 } else if (innertubeClientOauthEnabled) {
     // Fired when waiting for the user to authorize the sign in attempt.
     innertubeClient.session.on("auth-pending", (data) => {

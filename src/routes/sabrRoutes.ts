@@ -549,6 +549,7 @@ sabrRoutes.get("/:videoId/manifest.mpd", async (c) => {
             videoId,
             dashUrl,
             `live/${checkSegment}/`,
+            resolved.session.fetch ?? fetch,
         );
         c.header("content-type", "application/dash+xml");
         c.header("access-control-allow-origin", "*");
@@ -653,8 +654,8 @@ sabrRoutes.get("/:videoId/live/:check/:rep/*", async (c) => {
         });
     }
 
-    const base = await liveBaseUrl(videoId, rep);
-    if (!base) {
+    const held = await liveBaseUrl(videoId, rep);
+    if (!held) {
         throw new HTTPException(404, {
             res: new Response(
                 "Live manifest not held. Request the manifest first.",
@@ -677,7 +678,9 @@ sabrRoutes.get("/:videoId/live/:check/:rep/*", async (c) => {
         });
     }
 
-    const upstream = await fetch(base + tail, {
+    // From the address of the session that got the manifest: its URLs are
+    // bound to it.
+    const upstream = await held.fetch(held.base + tail, {
         headers: {
             accept: "*/*",
             origin: "https://www.youtube.com",

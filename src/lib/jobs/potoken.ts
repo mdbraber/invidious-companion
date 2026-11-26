@@ -11,6 +11,7 @@ import {
 } from "./camoufox.ts";
 import { BrowserPoTokenUnavailableError } from "../potoken/errors.ts";
 import { InputMessage, OutputMessageSchema } from "./worker.ts";
+import { drawSessionAddress } from "../helpers/youtubeSession.ts";
 let getFetchClientLocation = "getFetchClient";
 if (Deno.env.get("GET_FETCH_CLIENT_LOCATION")) {
     if (Deno.env.has("DENO_COMPILED")) {
@@ -29,7 +30,16 @@ import { PLAYER_ID } from "../../constants.ts";
 export type TokenMinter = (videoId: string) => Promise<string>;
 let generationInFlight: Promise<PoTokenResult> | undefined;
 let activeFallbackWorker: TokenGeneratorWorker | undefined;
-type PoTokenResult = { innertubeClient: Innertube; tokenMinter: TokenMinter };
+export type PoTokenResult = {
+    innertubeClient: Innertube;
+    tokenMinter: TokenMinter;
+    /**
+     * The address the whole session leaves from (see youtubeSession.ts);
+     * undefined without an IPv6 block or with per-request rotation. The
+     * caller commits it once it makes this session the live one.
+     */
+    localAddress?: string;
+};
 interface TokenGeneratorWorker extends Omit<Worker, "postMessage"> {
     postMessage(message: InputMessage): void;
 }
@@ -50,7 +60,14 @@ async function generatePoToken(
     config: Config,
     metrics: Metrics | undefined,
 ): Promise<PoTokenResult> {
-    const fetchImpl = getFetchClient(config);
+    // One address for the whole session: visitor data, BotGuard challenge,
+    // integrity token, validation, and later every player request made with
+    // this token. A retry (the caller's) draws a new one.
+    const localAddress = drawSessionAddress(config.networking.ipv6_block);
+    if (localAddress) {
+        console.log(`[INFO] PO token session will leave from ${localAddress}`);
+    }
+    const fetchImpl = getFetchClient(config, { localAddress });
     let generation;
     try {
         generation = await createCamoufoxPoTokenGeneration(
@@ -63,7 +80,7 @@ async function generatePoToken(
                 "[WARN] Camoufox is unavailable; using the JSDOM PO token fallback",
                 { error },
             );
-            return await generateWithJSDOM(config, metrics);
+            return await generateWithJSDOM(config, metrics, localAddress);
         }
         throw error;
     }
@@ -84,6 +101,7 @@ async function generatePoToken(
             config,
             integrityTokenBasedMinter: generation.mint,
             metrics,
+            fetchImpl,
         });
         await generation.activate();
         if (activeFallbackWorker) {
@@ -94,6 +112,7 @@ async function generatePoToken(
         return {
             innertubeClient: instantiatedInnertubeClient,
             tokenMinter: generation.mint,
+            localAddress,
         };
     } catch (error) {
         await generation.discard();
@@ -116,6 +135,7 @@ export async function closePoTokenRuntime(): Promise<void> {
 function generateWithJSDOM(
     config: Config,
     metrics: Metrics | undefined,
+    localAddress?: string,
 ): Promise<PoTokenResult> {
     const { promise, resolve, reject } = Promise.withResolvers<PoTokenResult>();
     const worker: TokenGeneratorWorker = new Worker(
@@ -149,7 +169,7 @@ function generateWithJSDOM(
         }
         const message = result.data;
         if (message.type === "ready") {
-            worker.postMessage({ type: "initialise", config });
+            worker.postMessage({ type: "initialise", config, localAddress });
             return;
         }
         if (message.type === "error") {
@@ -159,11 +179,12 @@ function generateWithJSDOM(
         if (message.type !== "initialised") return;
 
         try {
+            const fetchImpl = getFetchClient(config, { localAddress });
             const instantiatedInnertubeClient = await Innertube.create({
                 enable_session_cache: false,
                 po_token: message.sessionPoToken,
                 visitor_data: message.visitorData,
-                fetch: getFetchClient(config),
+                fetch: fetchImpl,
                 generate_session_locally: true,
                 cookie: config.youtube_session.cookies || undefined,
                 player_id: PLAYER_ID,
@@ -174,6 +195,7 @@ function generateWithJSDOM(
                 config,
                 integrityTokenBasedMinter: minter,
                 metrics,
+                fetchImpl,
             });
             if (settled) return;
             settled = true;
@@ -187,6 +209,7 @@ function generateWithJSDOM(
             resolve({
                 innertubeClient: instantiatedInnertubeClient,
                 tokenMinter: minter,
+                localAddress,
             });
         } catch (error) {
             fail(error);
@@ -271,14 +294,15 @@ async function checkToken({
     config,
     integrityTokenBasedMinter,
     metrics,
+    fetchImpl,
 }: {
     instantiatedInnertubeClient: Innertube;
     config: Config;
     integrityTokenBasedMinter: TokenMinter;
     metrics: Metrics | undefined;
+    /** The session's fetch: the stream URL is checked from its address. */
+    fetchImpl: ReturnType<typeof getFetchClient>;
 }) {
-    const fetchImpl = getFetchClient(config);
-
     try {
         console.log("[INFO] Searching for videos to validate PO token");
         const searchResults = await instantiatedInnertubeClient.search("news", {

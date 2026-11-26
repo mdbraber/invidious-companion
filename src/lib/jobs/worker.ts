@@ -24,13 +24,18 @@ if (Deno.env.get("GET_FETCH_CLIENT_LOCATION")) {
 
 type FetchFunction = typeof fetch;
 const { getFetchClient }: {
-    getFetchClient: (config: Config) => Promise<FetchFunction>;
+    getFetchClient: (
+        config: Config,
+        options?: { localAddress?: string },
+    ) => Promise<FetchFunction>;
 } = await import(getFetchClientLocation);
 
 // ---- Messages to send to the webworker ----
 const InputInitialiseSchema = z.object({
     type: z.literal("initialise"),
     config: ConfigSchema,
+    /** The session's address (see youtubeSession.ts); every request uses it. */
+    localAddress: z.string().optional(),
 }).strict();
 
 const InputContentTokenSchema = z.object({
@@ -106,6 +111,7 @@ if (isWorker) {
         if (message.type === "initialise") {
             const fetchImpl: typeof fetch = await getFetchClient(
                 message.config,
+                { localAddress: message.localAddress },
             );
             try {
                 const {

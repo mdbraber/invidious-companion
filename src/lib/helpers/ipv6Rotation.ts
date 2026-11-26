@@ -191,6 +191,44 @@ export function isIPv6Flagged(address: string, now = Date.now()): boolean {
     return until !== undefined && until > now;
 }
 
+type VerdictListener = (
+    address: string,
+    verdict: "bot" | "ok",
+    client: string | undefined,
+) => void;
+type FlagListener = (prefix: string) => void;
+const verdictListeners = new Set<VerdictListener>();
+const flagListeners = new Set<FlagListener>();
+
+/**
+ * Be told about every player answer `watchPlayerResponse` reads ("not a bot"
+ * or OK), WEB requests included, with the client it was sent as. Returns a
+ * function that removes the listener.
+ */
+export function onIPv6Verdict(listener: VerdictListener): () => void {
+    verdictListeners.add(listener);
+    return () => verdictListeners.delete(listener);
+}
+
+/** Be told when a /64 is newly flagged. Returns a remover. */
+export function onIPv6Flagged(listener: FlagListener): () => void {
+    flagListeners.add(listener);
+    return () => flagListeners.delete(listener);
+}
+
+function notify<T extends unknown[]>(
+    listeners: Set<(...args: T) => void>,
+    ...args: T
+): void {
+    for (const listener of listeners) {
+        try {
+            listener(...args);
+        } catch (err) {
+            console.log("[WARN] IPv6 listener failed", { err });
+        }
+    }
+}
+
 /** Avoid the /64 of `address` for NETWORKING_IPV6_FLAG_TTL_MS. */
 export function markIPv6Flagged(
     address: string,
@@ -208,6 +246,7 @@ export function markIPv6Flagged(
                     Math.round(FLAG_TTL_MS / 60_000)
                 } min (${flagged.size} flagged)`,
         );
+        notify(flagListeners, p);
     }
 }
 
@@ -307,8 +346,9 @@ function requestClient(init?: RequestInit): string | undefined {
  * copy of it in the background and count it for the address's /64 (see
  * `recordIPv6Verdict`): "confirm you're not a bot" is a strike, OK clears.
  * Other LOGIN_REQUIRED reasons (age checks, private videos) count for nothing,
- * and neither does any answer to a WEB request (`init` is the request's, to
- * tell). Returns nothing and never throws.
+ * and an answer to a WEB request (`init` is the request's, to tell) never
+ * counts toward flagging. Every "not a bot" / OK answer, WEB included, goes
+ * to the `onIPv6Verdict` listeners. Returns nothing and never throws.
  */
 export function watchPlayerResponse(
     input: Parameters<typeof fetch>[0],
@@ -318,7 +358,7 @@ export function watchPlayerResponse(
 ): void {
     if (!localAddress || !response.ok || !response.body) return;
     if (!requestUrl(input).includes(PLAYER_PATH)) return;
-    if (requestClient(init) === "WEB") return;
+    const client = requestClient(init);
     let copy: Response;
     try {
         copy = response.clone();
@@ -328,11 +368,23 @@ export function watchPlayerResponse(
     copy.json().then((data) => {
         const status = data?.playabilityStatus?.status;
         const reason = String(data?.playabilityStatus?.reason ?? "");
+        let verdict: "bot" | "ok" | undefined;
         if (status === "LOGIN_REQUIRED" && /\bbot\b/i.test(reason)) {
-            recordIPv6Verdict(localAddress, "bot", `${status}: ${reason}`);
+            verdict = "bot";
         } else if (status === "OK") {
-            recordIPv6Verdict(localAddress, "ok");
+            verdict = "ok";
         }
+        if (!verdict) return;
+        // WEB answers say nothing about the address (see the header), so they
+        // never flag; listeners still hear them (session rotation uses them).
+        if (client !== "WEB") {
+            recordIPv6Verdict(
+                localAddress,
+                verdict,
+                verdict === "bot" ? `${status}: ${reason}` : "",
+            );
+        }
+        notify(verdictListeners, localAddress, verdict, client);
     }).catch(() => {
         // not JSON, or the body was cancelled: nothing to learn
     });

@@ -1,10 +1,7 @@
 import { retry, type RetryOptions } from "@std/async";
 import type { Config } from "./config.ts";
-import {
-    generateRandomIPv6,
-    isIPv6InBlock,
-    watchPlayerResponse,
-} from "./ipv6Rotation.ts";
+import { isIPv6InBlock, watchPlayerResponse } from "./ipv6Rotation.ts";
+import { egressAddress } from "./youtubeSession.ts";
 
 type FetchInputParameter = Parameters<typeof fetch>[0];
 type FetchInitParameterWithClient =
@@ -14,9 +11,10 @@ type FetchReturn = ReturnType<typeof fetch>;
 
 export type FetchClientOptions = {
     /**
-     * Send every request from this address instead of a random one per
-     * request. Only honoured when it lies inside the configured IPv6 block;
-     * otherwise rotation behaves as usual.
+     * Send every request from this address (a session's, see
+     * `youtubeSession.ts`). Only honoured when it lies inside the configured
+     * IPv6 block; otherwise requests leave from the live session's address
+     * (NETWORKING_IPV6_ROTATION=session) or a random one per request.
      */
     localAddress?: string;
 };
@@ -46,9 +44,9 @@ export const getFetchClient = (config: Config, options?: FetchClientOptions): {
         jitter: 0,
     };
 
-    // If proxy or IPv6 rotation is configured, create a custom HTTP client
-    // IPv6 rotation generates a unique localAddress for each request to help
-    // avoid YouTube's "Please login" errors (unless the caller pinned one)
+    // If proxy or IPv6 rotation is configured, create a custom HTTP client.
+    // With IPv6, each request leaves from the pinned address, else the live
+    // session's (see youtubeSession.ts), else a random one per request.
     if (proxyAddress || ipv6Block) {
         // For proxy-only (no IPv6 rotation), reuse a single client
         const reusableClient = proxyAddress && !ipv6Block
@@ -70,8 +68,7 @@ export const getFetchClient = (config: Config, options?: FetchClientOptions): {
                     clientOptions.proxy = { url: proxyAddress };
                 }
                 if (ipv6Block) {
-                    localAddress = pinnedAddress ??
-                        generateRandomIPv6(ipv6Block);
+                    localAddress = egressAddress(ipv6Block, pinnedAddress);
                     clientOptions.localAddress = localAddress;
                 }
                 client = Deno.createHttpClient(clientOptions);

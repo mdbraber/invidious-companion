@@ -70,6 +70,30 @@ behind invidious.home.nedworks.org and serves OwnTube (see OwnTube's
   address (the same /64 drew it and then OK, a listed /64 served VISIONOS
   fine), and with a stale PO token every WEB request draws it, so flagging on
   the first verdict listed 142 of the /56's 256 /64s in two hours.
+- **One egress address per YouTube session** (`src/lib/helpers/youtubeSession.ts`,
+  used by `getFetchClient`, `src/lib/jobs/potoken.ts`, `worker.ts`, `main.ts`
+  and the live SABR path): per-request rotation spread one session over
+  hundreds of /64s. A PO token's visitor data, BotGuard challenge and
+  integrity token each came from another address, and every player request
+  made with it from yet another, which looks like a token shared by a bot
+  farm. On 2026-11-26 YouTube answered "not a bot" to WEB requests from the
+  whole /56, while the same code from one IPv4 address validated at once. With
+  `NETWORKING_IPV6_ROTATION=session` (default) a session draws one address
+  (skipping flagged /64s) and pins its fetch to it. That covers the PO token
+  job (Camoufox and the JSDOM worker), validation, and the Innertube client
+  serving every player, fallback-client and caption request. The address
+  becomes the live one (`commitSessionAddress`) only once the session
+  validated; a failed attempt keeps the old session, and each retry draws a
+  new address. Unpinned requests leave from the live session's address.
+  The session rotates early, through the same regeneration as the cron, when
+  its /64 gets flagged or after `NETWORKING_IPV6_SESSION_ROTATE_STRIKES` (5)
+  "not a bot" answers in a row, WEB included, at most every
+  `NETWORKING_IPV6_SESSION_ROTATE_MIN_INTERVAL_MS` (5 min). SABR sessions keep
+  one address each (their own visitor data). A live manifest's URLs and
+  segments are now fetched through the SABR session that got them, not the
+  default route. `NETWORKING_IPV6_ROTATION=request` restores per-request
+  rotation. The Camoufox page makes no requests of its own (all routes are
+  aborted), so it needs no pinning.
 - **SABR sessions ask once more after "not a bot"** (`openWithBotRetry` in
   `src/lib/sabr/session.ts`): VISIONOS and the ANDROID_VR fallback each get a
   second player request on that verdict before giving up, instead of the
@@ -113,6 +137,9 @@ ended). Drop these when upstream fixes the same.
 | `SABR_POT_URL` | — | PO token provider for WEB sessions (dubbed audio); ANDROID_VR needs none |
 | `NETWORKING_IPV6_FLAG_TTL_MS` | 86400000 | how long a /64 that drew "not a bot" is avoided by rotation |
 | `NETWORKING_IPV6_FLAG_STRIKES` | 3 | "not a bot" verdicts in a row (no OK between) before rotation avoids a /64 |
+| `NETWORKING_IPV6_ROTATION` | session | `session`: one address per YouTube session (see above); `request`: a random address per request (the old behaviour) |
+| `NETWORKING_IPV6_SESSION_ROTATE_STRIKES` | 5 | "not a bot" answers in a row (WEB included) on the live session's /64 before it rotates early |
+| `NETWORKING_IPV6_SESSION_ROTATE_MIN_INTERVAL_MS` | 300000 | the least time between two early rotations |
 | `YOUTUBEJS_LOG_LEVEL` | error | `none`, `error`, `warning`, `info` or `debug`: YouTube.js log levels shown |
 | `SERVER_LOG_MEDIA_REQUESTS` | — | `true` logs `/videoplayback` and SABR segment requests again |
 | `SABR_SEED_HEIGHT` / `SABR_MAX_HEIGHT` | 360 / 1080 | SABR VOD ladder |

@@ -26,6 +26,11 @@ export interface LiveManifest {
     /** The real googlevideo BaseURL per representation index. */
     baseUrls: string[];
     at: number;
+    /**
+     * The fetch of the SABR session the manifest came from: its URLs are
+     * fetched from that session's address (see lib/sabr/egress.ts).
+     */
+    fetch: typeof fetch;
 }
 
 const cache = new Map<string, Promise<LiveManifest>>();
@@ -58,8 +63,9 @@ async function load(
     videoId: string,
     dashManifestUrl: string,
     prefix: string,
+    fetchImpl: typeof fetch,
 ): Promise<LiveManifest> {
-    const res = await fetch(dashManifestUrl);
+    const res = await fetchImpl(dashManifestUrl);
     if (!res.ok) {
         throw new Error(
             `${videoId}: native DASH manifest returned HTTP ${res.status}`,
@@ -70,7 +76,7 @@ async function load(
     if (!baseUrls.length) {
         throw new Error(`${videoId}: native manifest carries no BaseURL`);
     }
-    return { xml, baseUrls, at: Date.now() };
+    return { xml, baseUrls, at: Date.now(), fetch: fetchImpl };
 }
 
 /**
@@ -83,12 +89,15 @@ export function getLiveManifest(
     videoId: string,
     dashManifestUrl: string,
     prefix: string,
+    fetchImpl: typeof fetch = fetch,
 ): Promise<LiveManifest> {
     const refresh = () => {
-        const p = load(videoId, dashManifestUrl, prefix).catch((e) => {
-            cache.delete(videoId);
-            throw e;
-        });
+        const p = load(videoId, dashManifestUrl, prefix, fetchImpl).catch(
+            (e) => {
+                cache.delete(videoId);
+                throw e;
+            },
+        );
         cache.set(videoId, p);
         return p;
     };
@@ -100,15 +109,20 @@ export function getLiveManifest(
         .catch(() => refresh());
 }
 
-/** The stored BaseURL for a representation, if the manifest is still held. */
+/**
+ * The stored BaseURL for a representation and the fetch to get its segments
+ * with (the manifest's session's), if the manifest is still held.
+ */
 export async function liveBaseUrl(
     videoId: string,
     index: number,
-): Promise<string | undefined> {
+): Promise<{ base: string; fetch: typeof fetch } | undefined> {
     const entry = cache.get(videoId);
     if (!entry) return undefined;
     try {
-        return (await entry).baseUrls[index];
+        const manifest = await entry;
+        const base = manifest.baseUrls[index];
+        return base ? { base, fetch: manifest.fetch } : undefined;
     } catch {
         return undefined;
     }
