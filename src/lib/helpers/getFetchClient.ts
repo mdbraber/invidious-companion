@@ -85,7 +85,7 @@ export const getFetchClient = (config: Config, options?: FetchClientOptions): {
             });
 
             // Learn which /64s YouTube rejects as bots, so rotation skips them.
-            watchPlayerResponse(input, fetchRes, localAddress);
+            watchPlayerResponse(input, fetchRes, localAddress, init);
 
             // If using a reusable client, return directly without closing
             if (reusableClient) {

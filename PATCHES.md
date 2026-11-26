@@ -63,6 +63,17 @@ behind invidious.home.nedworks.org and serves OwnTube (see OwnTube's
   YouTube (...)` once per /64. Only useful with a block wider than a /64; the
   list is per isolate (the PO-token worker has its own) and a restart forgets
   it. The request that drew the verdict still fails.
+  Since 2026-11-26 a /64 is listed only after `NETWORKING_IPV6_FLAG_STRIKES`
+  (3) verdicts in a row, and an OK player answer from it clears its strikes
+  and lists it no longer. WEB requests (and any carrying a PO token) don't
+  count. Measured that day: the verdict is mostly per request, not per
+  address (the same /64 drew it and then OK, a listed /64 served VISIONOS
+  fine), and with a stale PO token every WEB request draws it, so flagging on
+  the first verdict listed 142 of the /56's 256 /64s in two hours.
+- **SABR sessions ask once more after "not a bot"** (`openWithBotRetry` in
+  `src/lib/sabr/session.ts`): VISIONOS and the ANDROID_VR fallback each get a
+  second player request on that verdict before giving up, instead of the
+  video falling to the byte-range path whose URLs are revoked ~1 min in.
 - **Quieter logs** (`src/lib/helpers/logLevel.ts`): YouTube.js logs only
   errors by default (its parser warnings dump ~45 lines of class source per
   "X changed!" on every player request), and the request logger skips
@@ -101,6 +112,7 @@ ended). Drop these when upstream fixes the same.
 | `SABR_LIVE_MANIFEST_TTL_MS` | 20000 | re-fetch interval for YouTube's live manifest. We run **5000**: players only see segments the manifest lists. |
 | `SABR_POT_URL` | — | PO token provider for WEB sessions (dubbed audio); ANDROID_VR needs none |
 | `NETWORKING_IPV6_FLAG_TTL_MS` | 86400000 | how long a /64 that drew "not a bot" is avoided by rotation |
+| `NETWORKING_IPV6_FLAG_STRIKES` | 3 | "not a bot" verdicts in a row (no OK between) before rotation avoids a /64 |
 | `YOUTUBEJS_LOG_LEVEL` | error | `none`, `error`, `warning`, `info` or `debug`: YouTube.js log levels shown |
 | `SERVER_LOG_MEDIA_REQUESTS` | — | `true` logs `/videoplayback` and SABR segment requests again |
 | `SABR_SEED_HEIGHT` / `SABR_MAX_HEIGHT` | 360 / 1080 | SABR VOD ladder |

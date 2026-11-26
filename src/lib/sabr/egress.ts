@@ -36,9 +36,9 @@ export function sessionFetch(): SessionFetch {
             input,
             { ...(init ?? {}), client } as RequestInit,
         );
-        // A session whose player request draws "not a bot" flags its /64,
-        // so the next session (the route's retry) picks another one.
-        watchPlayerResponse(input, res, localAddress);
+        // Player answers count for the session's /64: repeated "not a bot"
+        // verdicts list it, so later sessions pick another one.
+        watchPlayerResponse(input, res, localAddress, init);
         return res;
     }) as SessionFetch;
 }

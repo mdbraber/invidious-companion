@@ -6,6 +6,7 @@ import {
     isIPv6InBlock,
     markIPv6Flagged,
     prefix64,
+    recordIPv6Verdict,
     watchPlayerResponse,
 } from "../lib/helpers/ipv6Rotation.ts";
 
@@ -169,39 +170,125 @@ async function settle(): Promise<void> {
     await new Promise((r) => setTimeout(r, 20));
 }
 
-Deno.test("watchPlayerResponse - flags on 'not a bot' only", async () => {
-    clearIPv6Flags();
-    const url = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
+const BOT = "Sign in to confirm you’re not a bot";
+const PLAYER_URL =
+    "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
 
-    const bot = playerResponse(
-        "LOGIN_REQUIRED",
-        "Sign in to confirm you’re not a bot",
-    );
-    watchPlayerResponse(url, bot, "2001:db8:0:10::1");
-    await bot.text(); // the caller still gets the whole body
+async function watch(
+    status: string,
+    reason: string,
+    address: string,
+    init?: RequestInit,
+    url = PLAYER_URL,
+): Promise<void> {
+    const res = playerResponse(status, reason);
+    watchPlayerResponse(url, res, address, init);
+    await res.text(); // the caller still gets the whole body
     await settle();
+}
+
+Deno.test("recordIPv6Verdict - lists a /64 only after 3 verdicts in a row", () => {
+    clearIPv6Flags();
+    const now = Date.now();
+    recordIPv6Verdict("2001:db8:0:20::1", "bot", "test", now);
+    recordIPv6Verdict("2001:db8:0:20::2", "bot", "test", now + 1);
+    assertEquals(isIPv6Flagged("2001:db8:0:20::3", now + 2), false);
+    recordIPv6Verdict("2001:db8:0:20::3", "bot", "test", now + 2);
+    assertEquals(isIPv6Flagged("2001:db8:0:20::4", now + 3), true);
+    clearIPv6Flags();
+});
+
+Deno.test("recordIPv6Verdict - an OK clears strikes and the listing", () => {
+    clearIPv6Flags();
+    const now = Date.now();
+    recordIPv6Verdict("2001:db8:0:21::1", "bot", "test", now);
+    recordIPv6Verdict("2001:db8:0:21::1", "bot", "test", now + 1);
+    recordIPv6Verdict("2001:db8:0:21::1", "ok", "", now + 2);
+    recordIPv6Verdict("2001:db8:0:21::1", "bot", "test", now + 3);
+    recordIPv6Verdict("2001:db8:0:21::1", "bot", "test", now + 4);
+    assertEquals(isIPv6Flagged("2001:db8:0:21::1", now + 5), false);
+
+    markIPv6Flagged("2001:db8:0:22::1", "test", now);
+    recordIPv6Verdict("2001:db8:0:22::9", "ok", "", now + 1);
+    assertEquals(isIPv6Flagged("2001:db8:0:22::1", now + 2), false);
+    clearIPv6Flags();
+});
+
+Deno.test("recordIPv6Verdict - strikes older than the TTL start over", () => {
+    clearIPv6Flags();
+    const now = Date.now();
+    recordIPv6Verdict("2001:db8:0:23::1", "bot", "test", now);
+    recordIPv6Verdict("2001:db8:0:23::1", "bot", "test", now + 1);
+    const later = now + 25 * 3600_000;
+    recordIPv6Verdict("2001:db8:0:23::1", "bot", "test", later);
+    assertEquals(isIPv6Flagged("2001:db8:0:23::1", later + 1), false);
+    clearIPv6Flags();
+});
+
+Deno.test("watchPlayerResponse - counts 'not a bot' and OK only", async () => {
+    clearIPv6Flags();
+    for (let i = 0; i < 3; i++) {
+        await watch("LOGIN_REQUIRED", BOT, `2001:db8:0:10::${i + 1}`);
+    }
     assertEquals(isIPv6Flagged("2001:db8:0:10::99"), true);
 
-    const age = playerResponse("LOGIN_REQUIRED", "Sign in to confirm your age");
-    watchPlayerResponse(url, age, "2001:db8:0:11::1");
-    await age.text();
-    await settle();
+    for (let i = 0; i < 3; i++) {
+        await watch(
+            "LOGIN_REQUIRED",
+            "Sign in to confirm your age",
+            "2001:db8:0:11::1",
+        );
+    }
     assertEquals(isIPv6Flagged("2001:db8:0:11::1"), false);
 
-    const ok = playerResponse("OK", "");
-    watchPlayerResponse(url, ok, "2001:db8:0:12::1");
-    await ok.text();
-    await settle();
+    await watch("LOGIN_REQUIRED", BOT, "2001:db8:0:12::1");
+    await watch("LOGIN_REQUIRED", BOT, "2001:db8:0:12::1");
+    await watch("OK", "", "2001:db8:0:12::1");
+    await watch("LOGIN_REQUIRED", BOT, "2001:db8:0:12::1");
     assertEquals(isIPv6Flagged("2001:db8:0:12::1"), false);
 
-    const other = playerResponse("LOGIN_REQUIRED", "not a bot");
-    watchPlayerResponse(
-        "https://www.youtube.com/youtubei/v1/next",
-        other,
-        "2001:db8:0:13::1",
-    );
-    await other.text();
-    await settle();
+    for (let i = 0; i < 3; i++) {
+        await watch(
+            "LOGIN_REQUIRED",
+            "not a bot",
+            "2001:db8:0:13::1",
+            undefined,
+            "https://www.youtube.com/youtubei/v1/next",
+        );
+    }
     assertEquals(isIPv6Flagged("2001:db8:0:13::1"), false);
+    clearIPv6Flags();
+});
+
+Deno.test("watchPlayerResponse - ignores WEB requests", async () => {
+    clearIPv6Flags();
+    const web = {
+        method: "POST",
+        body: JSON.stringify({ context: { client: { clientName: "WEB" } } }),
+    };
+    const pot = {
+        method: "POST",
+        body: JSON.stringify({
+            context: { client: { clientName: "MWEB" } },
+            serviceIntegrityDimensions: { poToken: "x" },
+        }),
+    };
+    for (let i = 0; i < 3; i++) {
+        await watch("LOGIN_REQUIRED", BOT, "2001:db8:0:14::1", web);
+        await watch("LOGIN_REQUIRED", BOT, "2001:db8:0:15::1", pot);
+    }
+    assertEquals(isIPv6Flagged("2001:db8:0:14::1"), false);
+    assertEquals(isIPv6Flagged("2001:db8:0:15::1"), false);
+
+    const vr = {
+        method: "POST",
+        body: JSON.stringify({
+            context: { client: { clientName: "ANDROID_VR" } },
+        }),
+    };
+    for (let i = 0; i < 3; i++) {
+        await watch("LOGIN_REQUIRED", BOT, "2001:db8:0:16::1", vr);
+    }
+    assertEquals(isIPv6Flagged("2001:db8:0:16::1"), true);
     clearIPv6Flags();
 });

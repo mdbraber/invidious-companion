@@ -140,19 +140,36 @@ function bytesToIPv6(bytes: number[]): string {
 
 // ---- Flagged /64s ----------------------------------------------------------
 //
-// YouTube's "Sign in to confirm you're not a bot" verdict sticks to a whole
+// YouTube's "Sign in to confirm you're not a bot" verdict can stick to a whole
 // /64 (2026-11-18: every address of 2a02:a45d:15fe:15::/64 got it, while the
 // neighbouring /64s did not). With a block wider than a /64, remember each /64
-// that drew the verdict and leave it alone for a while, so later requests and
-// SABR sessions land on clean ones. In-memory, per isolate (the PO-token worker
-// keeps its own list); a restart forgets.
+// that keeps drawing the verdict and leave it alone for a while, so later
+// requests and SABR sessions land on clean ones. In-memory, per isolate (the
+// PO-token worker keeps its own list); a restart forgets.
+//
+// One verdict is not enough: most of them are about the request, not the
+// address. Measured 2026-11-26 from the companion's /56: the same /64 answered
+// one ANDROID_VR request "not a bot" and the next one OK, a /64 already on the
+// list served VISIONOS fine, and a never-used one drew the verdict on its first
+// request. Flagging on the first verdict put 142 of the 256 /64s on the list
+// in two hours. So a /64 is listed only after NETWORKING_IPV6_FLAG_STRIKES
+// verdicts in a row (default 3), and any OK answer from it clears its strikes
+// (and takes it off the list). WEB requests don't count either way: while the
+// PO token is stale every WEB request gets the verdict, from any /64.
 // NETWORKING_IPV6_FLAG_TTL_MS: how long a /64 is avoided (default 24 h).
 
 const FLAG_TTL_MS = Number(
     Deno.env.get("NETWORKING_IPV6_FLAG_TTL_MS") || 24 * 3600_000,
 );
+const FLAG_STRIKES = Math.max(
+    1,
+    Math.floor(Number(Deno.env.get("NETWORKING_IPV6_FLAG_STRIKES") || 3)) || 3,
+);
 const MAX_DRAWS = 64;
+const MAX_STRIKE_ENTRIES = 4096;
 const flagged = new Map<string, number>(); // /64 prefix -> avoid until (ms)
+// /64 prefix -> "not a bot" verdicts in a row, and when the last one came
+const strikes = new Map<string, { count: number; at: number }>();
 let warnedAllFlagged = 0;
 
 /** The /64 an address lies in, as "xxxx:xxxx:xxxx:xxxx::/64". */
@@ -194,9 +211,47 @@ export function markIPv6Flagged(
     }
 }
 
-/** Forget every flagged /64 (tests). */
+/**
+ * Count one player answer from `address`: a "not a bot" verdict adds a
+ * strike to its /64, and the FLAG_STRIKES-th in a row (within the flag TTL)
+ * lists it; an OK answer clears its strikes and takes it off the list.
+ */
+export function recordIPv6Verdict(
+    address: string,
+    verdict: "bot" | "ok",
+    reason = "",
+    now = Date.now(),
+): void {
+    const p = prefix64(address);
+    if (verdict === "ok") {
+        strikes.delete(p);
+        if (flagged.delete(p)) {
+            console.log(
+                `[INFO] IPv6 ${p} answered OK again; no longer avoided ` +
+                    `(${flagged.size} flagged)`,
+            );
+        }
+        return;
+    }
+    const prev = strikes.get(p);
+    const count = prev && now - prev.at < FLAG_TTL_MS ? prev.count + 1 : 1;
+    if (count >= FLAG_STRIKES) {
+        strikes.delete(p);
+        markIPv6Flagged(address, `${reason}; ${count} in a row`, now);
+        return;
+    }
+    if (strikes.size >= MAX_STRIKE_ENTRIES) {
+        for (const [k, v] of strikes) {
+            if (now - v.at >= FLAG_TTL_MS) strikes.delete(k);
+        }
+    }
+    strikes.set(p, { count, at: now });
+}
+
+/** Forget every flagged /64 and every strike (tests). */
 export function clearIPv6Flags(): void {
     flagged.clear();
+    strikes.clear();
     warnedAllFlagged = 0;
 }
 
@@ -232,18 +287,38 @@ function requestUrl(input: Parameters<typeof fetch>[0]): string {
 }
 
 /**
+ * The client a player request was sent as, from its JSON body
+ * (`context.client.clientName`), or undefined when the body is not a string.
+ */
+function requestClient(init?: RequestInit): string | undefined {
+    if (typeof init?.body !== "string") return undefined;
+    try {
+        const body = JSON.parse(init.body);
+        if (body?.serviceIntegrityDimensions?.poToken) return "WEB";
+        const name = body?.context?.client?.clientName;
+        return typeof name === "string" ? name : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+/**
  * When `response` answers a player request sent from `localAddress`, read a
- * copy of it in the background and flag the address's /64 if YouTube asked
- * to "confirm you're not a bot". Other LOGIN_REQUIRED reasons (age checks,
- * private videos) do not flag. Returns nothing and never throws.
+ * copy of it in the background and count it for the address's /64 (see
+ * `recordIPv6Verdict`): "confirm you're not a bot" is a strike, OK clears.
+ * Other LOGIN_REQUIRED reasons (age checks, private videos) count for nothing,
+ * and neither does any answer to a WEB request (`init` is the request's, to
+ * tell). Returns nothing and never throws.
  */
 export function watchPlayerResponse(
     input: Parameters<typeof fetch>[0],
     response: Response,
     localAddress: string | undefined,
+    init?: RequestInit,
 ): void {
     if (!localAddress || !response.ok || !response.body) return;
     if (!requestUrl(input).includes(PLAYER_PATH)) return;
+    if (requestClient(init) === "WEB") return;
     let copy: Response;
     try {
         copy = response.clone();
@@ -254,7 +329,9 @@ export function watchPlayerResponse(
         const status = data?.playabilityStatus?.status;
         const reason = String(data?.playabilityStatus?.reason ?? "");
         if (status === "LOGIN_REQUIRED" && /\bbot\b/i.test(reason)) {
-            markIPv6Flagged(localAddress, `${status}: ${reason}`);
+            recordIPv6Verdict(localAddress, "bot", `${status}: ${reason}`);
+        } else if (status === "OK") {
+            recordIPv6Verdict(localAddress, "ok");
         }
     }).catch(() => {
         // not JSON, or the body was cancelled: nothing to learn

@@ -509,6 +509,36 @@ export async function openSabrSession(
     return s;
 }
 
+/** A player error that is YouTube's "confirm you're not a bot" verdict. */
+export function isBotVerdict(err: unknown): boolean {
+    return /playability LOGIN_REQUIRED:.*\bbot\b/i.test(
+        (err as Error)?.message ?? "",
+    );
+}
+
+/**
+ * Open a session, asking once more when YouTube answers "not a bot". The
+ * verdict is mostly about the request, not the address: measured 2026-11-26,
+ * the same ANDROID_VR request from the same address drew it and then got OK
+ * (see `ipv6Rotation.ts`), so a second ask often saves the video from the
+ * byte-range fallback, whose URLs are revoked ~1 min in.
+ */
+export async function openWithBotRetry<T>(
+    videoId: string,
+    client: string,
+    open: () => Promise<T>,
+): Promise<T> {
+    try {
+        return await open();
+    } catch (err) {
+        if (!isBotVerdict(err)) throw err;
+        console.log(
+            `[INFO] [sabr] [${videoId}] ${client}: "not a bot" verdict; asking once more`,
+        );
+        return await open();
+    }
+}
+
 async function openSabrSessionWith(
     videoId: string,
     needsFullFormats: boolean,
@@ -516,7 +546,11 @@ async function openSabrSessionWith(
 ): Promise<SabrSession> {
     let vision: SabrSession | undefined;
     try {
-        vision = await openVisionSession(videoId, egress);
+        vision = await openWithBotRetry(
+            videoId,
+            "VISIONOS",
+            () => openVisionSession(videoId, egress),
+        );
     } catch (err) {
         console.log(
             `[WARN] [sabr] [${videoId}] VISIONOS session failed (${
@@ -543,7 +577,11 @@ async function openSabrSessionWith(
             if (vision) return vision;
         }
     }
-    return await openVrSession(videoId, egress);
+    return await openWithBotRetry(
+        videoId,
+        "ANDROID_VR",
+        () => openVrSession(videoId, egress),
+    );
 }
 
 /** Re-fetch the player response for a session, keeping its client. */
